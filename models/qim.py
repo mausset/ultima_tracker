@@ -190,7 +190,7 @@ def pos2posemb(pos, num_pos_feats=64, temperature=10000):
     posemb = torch.stack((posemb[..., 0::2].sin(), posemb[..., 1::2].cos()), dim=-1).flatten(-3)
     return posemb
 
-
+        
 def build(args, layer_name, dim_in, hidden_dim, dim_out):
     interaction_layers = {
         'QIM': QueryInteractionModule,

@@ -1,12 +1,13 @@
 --meta_arch motr
 --dataset_file e2e_dance
---epoch 5
+--epoch 10
 --with_box_refine
---lr_drop 4
+--lr_drop 9
 --lr 2e-4
 --lr_backbone 2e-5
---pretrained /data/projects/motr_mod/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
 --batch_size 1
+--resume /home/rickard/experiments/ultima_tracker/MOTRv2/exps/motrv2/run1/checkpoint.pth
+--num_accumulate_batches 64
 --sample_mode random_interval
 --sample_interval 10
 --sampler_lengths 5
@@ -18,5 +19,5 @@
 --query_denoise 0.05
 --num_queries 10
 --append_crowd
+--mot_path /home/rickard/experiments/ultima_tracker/MOTRv2/data/Dataset/mot
 --det_db det_db_motrv2.json
---use_checkpoint

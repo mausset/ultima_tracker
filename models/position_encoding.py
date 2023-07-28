@@ -15,9 +15,54 @@ Various positional encodings for the transformer.
 import math
 import torch
 from torch import nn
+import numpy as np
+from einops import rearrange
 
 from util.misc import NestedTensor
 
+class PositionEmebeddingFourierLearned(nn.Module):
+    """
+    Positional encoding learned in the Fourier basis. Useful to embed sparse objects (e.g. points or bounding boxes).
+    NOTE: In the case of bounding boxes, the coordinates are considered in groups of 2 (x, y).
+    """
+
+    def __init__(self, num_pos_feats: int = 64, out_dim: int = 256, scale = None) -> None:
+        super().__init__()
+        if scale is None or scale <= 0.0:
+            scale = 1.0
+
+        self.positional_encoding_gaussian = nn.Parameter(scale * torch.randn((2, num_pos_feats)))
+
+        self.ffn = nn.Sequential(
+            nn.Linear(2*num_pos_feats, num_pos_feats),
+            nn.GELU(),
+            nn.Linear(num_pos_feats, out_dim//2),
+        )
+
+    def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
+        """Positionally encode points that are normalized to [0,1]."""
+        # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shap
+        coords = 2 * coords - 1
+        #coords = coords @ self.positional_encoding_gaussian_matrix
+        coords = coords @ self.positional_encoding_gaussian
+        coords = 2 * np.pi * coords
+        # outputs d_1 x ... x d_n x C shape
+        return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
+    
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Bounding boxes to be embedded. Shape (N_tracks, self.context_dim, 4).
+        """
+        
+        x = rearrange(x, 'n (g m) -> n g m', g=2)
+        x = self._pe_encoding(x)
+
+        x = self.ffn(x)
+
+        x = rearrange(x, 'n g m -> n (g m)')
+
+        return x
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -93,6 +138,8 @@ def build_position_encoding(args):
         position_embedding = PositionEmbeddingSine(N_steps, normalize=True)
     elif args.position_embedding in ('v3', 'learned'):
         position_embedding = PositionEmbeddingLearned(N_steps)
+    elif args.position_embedding in ('v4', 'fourier'):
+        position_embedding = PositionEmebeddingFourierLearned(N_steps, args.hidden_dim)
     else:
         raise ValueError(f"not supported {args.position_embedding}")
 

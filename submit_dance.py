@@ -14,7 +14,10 @@ import json
 import os
 import argparse
 import torchvision.transforms.functional as F
+from torch.nn.functional import normalize
 import torch
+import torch.nn as nn
+import lap
 import cv2
 from tqdm import tqdm
 from pathlib import Path
@@ -24,7 +27,8 @@ from main import get_args_parser
 
 from models.structures import Instances
 from torch.utils.data import Dataset, DataLoader
-
+from util.misc import NestedTensor
+from util.box_ops import box_cxcywh_to_xyxy
 
 class ListImgDataset(Dataset):
     def __init__(self, mot_path, img_list, det_db) -> None:
@@ -77,10 +81,103 @@ class ListImgDataset(Dataset):
         return self.init_img(img, proposals)
 
 
+class RuntimeTracker(nn.Module):
+
+    def __init__(self, similarity_threshold, miss_tolerance) -> None:
+        super().__init__()
+        self.similarity_threshold = similarity_threshold
+        self.miss_tolerance = miss_tolerance
+
+        self.time_since_seen = {}
+        self.tracks = {}
+        self.max_id = 0
+
+    def reset(self):
+        self.time_since_seen = {}
+        self.tracks = {}
+        self.max_id = 0
+ 
+    def _init_fresh_tracks(self, proposal_queries):
+        assigned_ids = []
+        for proposal_query in proposal_queries:
+            self.tracks[self.max_id] = proposal_query
+            self.time_since_seen[self.max_id] = 0
+            assigned_ids.append(self.max_id)
+            self.max_id += 1
+        
+        return assigned_ids
+
+    def get_tracks(self):
+        if self.max_id == 0:
+            return None, None
+        track_ids, tracks = zip(*self.tracks.items())
+        tracks = [track.cuda() for track in tracks]
+        tracks = torch.stack(tracks).clone() # Make sure not to modify the original tracks, not sure if this is necessary
+
+        return track_ids, tracks
+
+    def _cosine_sim(self, track_queries, proposal_queries):
+        track_queries = normalize(track_queries, dim=-1)
+        proposal_queries = normalize(proposal_queries, dim=-1)
+
+        cosine_sim = torch.matmul(track_queries, proposal_queries.T)
+
+        return cosine_sim
+    
+    def get_assigments(self, proposal_queries, track_queries=None, track_ids=None):
+        if track_queries is None:
+            return self._init_fresh_tracks(proposal_queries)
+        
+        proposal_queries = proposal_queries.cpu() 
+        track_queries = track_queries.cpu()
+
+        cosine_sim = self._cosine_sim(track_queries, proposal_queries)
+
+        # Solve the linear assignment problem using the Hungarian algorithm and get correct matches
+        cost, row, col = lap.lapjv(-cosine_sim.numpy(), extend_cost=True, cost_limit=-self.similarity_threshold)
+
+        for identity, r in zip(track_ids, row):
+            if r == -1:
+                self.time_since_seen[identity] += 1
+                continue
+            self.time_since_seen[identity] = 0
+
+        for i, (proposal, c) in enumerate(zip(proposal_queries, col)):
+            if c == -1:
+                self.tracks[self.max_id] = proposal
+                self.time_since_seen[self.max_id] = 0
+                col[i] = self.max_id
+                self.max_id += 1
+            
+        return col
+    
+    def update_tracks(self, track_ids, updated_track_queries):
+        for track_id, track in zip(track_ids, updated_track_queries):
+            self.tracks[track_id] = track 
+
+    def cull_tracks(self):
+        for track_id in list(self.tracks.keys()):
+            if self.time_since_seen[track_id] > self.miss_tolerance:
+                del self.tracks[track_id]
+                del self.time_since_seen[track_id]
+
+
+def normalized_to_pixel_coordinates(normalized_coordinates, height, width):
+    """
+    Converts normalized coordinates (in the [0, 1] range) to pixel coordinates
+    (in the [0, height] range).
+    """
+    x1 = normalized_coordinates[:, 0].clone() * width
+    y1 = normalized_coordinates[:, 1].clone() * height
+    x2 = normalized_coordinates[:, 2].clone() * width
+    y2 = normalized_coordinates[:, 3].clone() * height
+    return torch.stack((x1, y1, x2, y2), dim=-1)
+
 class Detector(object):
-    def __init__(self, args, model, vid):
+    def __init__(self, args, model, tracker, vid):
         self.args = args
         self.detr = model
+        self.tracker = tracker
 
         self.vid = vid
         self.seq_num = os.path.basename(vid)
@@ -115,30 +212,37 @@ class Detector(object):
             det_db = json.load(f)
         loader = DataLoader(ListImgDataset(self.args.mot_path, self.img_list, det_db), 1, num_workers=2)
         lines = []
-        for i, data in enumerate(tqdm(loader)):
+        for i, data in enumerate(tqdm(loader, leave=False, desc=self.vid)):
             cur_img, ori_img, proposals = [d[0] for d in data]
             cur_img, proposals = cur_img.cuda(), proposals.cuda()
+            proposals = proposals[proposals[:, -1] > prob_threshold]
+            proposal_scores = proposals[:, -1].unsqueeze(-1)
+            
+            proposals = box_cxcywh_to_xyxy(proposals[:, :-1])
 
-            # track_instances = None
-            if track_instances is not None:
-                track_instances.remove('boxes')
-                track_instances.remove('labels')
             seq_h, seq_w, _ = ori_img.shape
+ 
+            samples = NestedTensor(
+                cur_img,
+                torch.zeros((seq_h, seq_w), dtype=torch.bool, device=cur_img.device).unsqueeze(0)
+            )
 
-            res = self.detr.inference_single_image(cur_img, (seq_h, seq_w), track_instances, proposals)
-            track_instances = res['track_instances']
+            track_ids, track_queries = self.tracker.get_tracks()
 
-            dt_instances = deepcopy(track_instances)
+            res = self.detr(samples, proposals, tracks=track_queries, proposal_scores=proposal_scores)
 
-            # filter det instances by score.
-            dt_instances = self.filter_dt_by_score(dt_instances, prob_threshold)
-            dt_instances = self.filter_dt_by_area(dt_instances, area_threshold)
+            proposal_queries = res['proposal_queries']
+            updated_track_queries = res['track_queries']
 
-            total_dts += len(dt_instances)
+            identities = self.tracker.get_assigments(proposal_queries, updated_track_queries, track_ids)
 
-            bbox_xyxy = dt_instances.boxes.tolist()
-            identities = dt_instances.obj_idxes.tolist()
+            if track_queries is not None:
+                updated_track_queries = self.detr.query_interaction(updated_track_queries, track_queries)
+                self.tracker.update_tracks(track_ids, updated_track_queries)
+            
+            self.tracker.cull_tracks()
 
+            bbox_xyxy = normalized_to_pixel_coordinates(proposals, seq_h, seq_w)
             save_format = '{frame},{id},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},1,-1,-1,-1\n'
             for xyxy, track_id in zip(bbox_xyxy, identities):
                 if track_id < 0 or track_id is None:
@@ -146,40 +250,41 @@ class Detector(object):
                 x1, y1, x2, y2 = xyxy
                 w, h = x2 - x1, y2 - y1
                 lines.append(save_format.format(frame=i + 1, id=track_id, x1=x1, y1=y1, w=w, h=h))
+        
+
         with open(os.path.join(self.predict_path, f'{self.seq_num}.txt'), 'w') as f:
             f.writelines(lines)
-        print("totally {} dts {} occlusion dts".format(total_dts, total_occlusion_dts))
 
-class RuntimeTrackerBase(object):
-    def __init__(self, score_thresh=0.6, filter_score_thresh=0.5, miss_tolerance=10):
-        self.score_thresh = score_thresh
-        self.filter_score_thresh = filter_score_thresh
-        self.miss_tolerance = miss_tolerance
-        self.max_obj_id = 0
+# class RuntimeTrackerBase(object):
+#     def __init__(self, score_thresh=0.6, filter_score_thresh=0.5, miss_tolerance=10):
+#         self.score_thresh = score_thresh
+#         self.filter_score_thresh = filter_score_thresh
+#         self.miss_tolerance = miss_tolerance
+#         self.max_obj_id = 0
 
-    def clear(self):
-        self.max_obj_id = 0
+#     def clear(self):
+#         self.max_obj_id = 0
 
-    def update(self, track_instances: Instances):
-        device = track_instances.obj_idxes.device
+#     def update(self, track_instances: Instances):
+#         device = track_instances.obj_idxes.device
 
-        track_instances.disappear_time[track_instances.scores >= self.score_thresh] = 0
-        new_obj = (track_instances.obj_idxes == -1) & (track_instances.scores >= self.score_thresh)
-        disappeared_obj = (track_instances.obj_idxes >= 0) & (track_instances.scores < self.filter_score_thresh)
-        num_new_objs = new_obj.sum().item()
+#         track_instances.disappear_time[track_instances.scores >= self.score_thresh] = 0
+#         new_obj = (track_instances.obj_idxes == -1) & (track_instances.scores >= self.score_thresh)
+#         disappeared_obj = (track_instances.obj_idxes >= 0) & (track_instances.scores < self.filter_score_thresh)
+#         num_new_objs = new_obj.sum().item()
 
-        track_instances.obj_idxes[new_obj] = self.max_obj_id + torch.arange(num_new_objs, device=device)
-        self.max_obj_id += num_new_objs
+#         track_instances.obj_idxes[new_obj] = self.max_obj_id + torch.arange(num_new_objs, device=device)
+#         self.max_obj_id += num_new_objs
 
-        track_instances.disappear_time[disappeared_obj] += 1
-        to_del = disappeared_obj & (track_instances.disappear_time >= self.miss_tolerance)
-        track_instances.obj_idxes[to_del] = -1
+#         track_instances.disappear_time[disappeared_obj] += 1
+#         to_del = disappeared_obj & (track_instances.disappear_time >= self.miss_tolerance)
+#         track_instances.obj_idxes[to_del] = -1
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    parser.add_argument('--score_threshold', default=0.5, type=float)
+    parser.add_argument('--score_threshold', default=0.3, type=float)
     parser.add_argument('--update_score_threshold', default=0.5, type=float)
     parser.add_argument('--miss_tolerance', default=20, type=int)
     args = parser.parse_args()
@@ -188,15 +293,17 @@ if __name__ == '__main__':
 
     # load model and weights
     detr, _, _ = build_model(args)
-    detr.track_embed.score_thr = args.update_score_threshold
-    detr.track_base = RuntimeTrackerBase(args.score_threshold, args.score_threshold, args.miss_tolerance)
+    # detr.track_embed.score_thr = args.update_score_threshold
+    tracker = RuntimeTracker(0.5, args.miss_tolerance)
+    # detr.track_base = RuntimeTracker(args.score_threshold, args.miss_tolerance)
     checkpoint = torch.load(args.resume, map_location='cpu')
-    detr = load_model(detr, args.resume)
+    # detr = load_model(detr, args.resume)
+    detr.load_state_dict(checkpoint['model'])
     detr.eval()
     detr = detr.cuda()
 
     # '''for MOT17 submit''' 
-    sub_dir = 'DanceTrack/test'
+    sub_dir = 'DanceTrack/val'
     seq_nums = os.listdir(os.path.join(args.mot_path, sub_dir))
     if 'seqmap' in seq_nums:
         seq_nums.remove('seqmap')
@@ -206,6 +313,7 @@ if __name__ == '__main__':
     ws = int(os.environ.get('RLAUNCH_REPLICA_TOTAL', '1'))
     vids = vids[rank::ws]
 
-    for vid in vids:
-        det = Detector(args, model=detr, vid=vid)
-        det.detect(args.score_threshold)
+    with torch.no_grad():
+        for vid in tqdm(vids, desc='vid'):
+            det = Detector(args, model=detr, tracker=tracker, vid=vid)
+            det.detect(args.score_threshold)

@@ -242,7 +242,7 @@ class DetMOTDetection:
         }
 
     def __len__(self):
-        return len(self.indices) + len(self.ch_indices)
+        return len(self.indices) # + len(self.ch_indices)
 
 
 class DetMOTDetectionValidation(DetMOTDetection):

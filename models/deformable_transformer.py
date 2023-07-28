@@ -1,13 +1,11 @@
 # ------------------------------------------------------------------------
-# Copyright (c) 2022 megvii-research. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
+# Deformable DETR
 # Copyright (c) 2020 SenseTime. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 # Modified from DETR (https://github.com/facebookresearch/detr)
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # ------------------------------------------------------------------------
-
 
 import copy
 from typing import Optional, List
@@ -18,10 +16,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 
-from models.structures import Boxes, matched_boxlist_iou, pairwise_iou
-
 from util.misc import inverse_sigmoid
-from util.box_ops import box_cxcywh_to_xyxy
 from models.ops.modules import MSDeformAttn
 
 
@@ -30,11 +25,9 @@ class DeformableTransformer(nn.Module):
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024, dropout=0.1,
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
-                 two_stage=False, two_stage_num_proposals=300, decoder_self_cross=True, sigmoid_attn=False,
-                 extra_track_attn=False, memory_bank=False):
+                 two_stage=False, two_stage_num_proposals=300):
         super().__init__()
 
-        self.new_frame_adaptor = None
         self.d_model = d_model
         self.nhead = nhead
         self.two_stage = two_stage
@@ -42,26 +35,29 @@ class DeformableTransformer(nn.Module):
 
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          num_feature_levels, nhead, enc_n_points,
-                                                          sigmoid_attn=sigmoid_attn)
+                                                          num_feature_levels, nhead, enc_n_points)
         self.encoder = DeformableTransformerEncoder(encoder_layer, num_encoder_layers)
 
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          num_feature_levels, nhead, dec_n_points, decoder_self_cross,
-                                                          sigmoid_attn=sigmoid_attn, extra_track_attn=extra_track_attn,
-                                                          memory_bank=memory_bank)
+                                                          num_feature_levels, nhead, dec_n_points)
         self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
-
-        self.reference_points = nn.Linear(d_model, 2)
 
         if two_stage:
             self.enc_output = nn.Linear(d_model, d_model)
             self.enc_output_norm = nn.LayerNorm(d_model)
             self.pos_trans = nn.Linear(d_model * 2, d_model * 2)
             self.pos_trans_norm = nn.LayerNorm(d_model * 2)
+        else:
+            self.reference_points = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, 4)
+            )
 
         self._reset_parameters()
 
@@ -72,6 +68,9 @@ class DeformableTransformer(nn.Module):
         for m in self.modules():
             if isinstance(m, MSDeformAttn):
                 m._reset_parameters()
+        # if not self.two_stage:
+            # xavier_uniform_(self.reference_points.weight.data, gain=1.0)
+            # constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
 
     def get_proposal_pos_embed(self, proposals):
@@ -130,7 +129,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, ref_pts=None, mem_bank=None, mem_bank_pad_mask=None, attn_mask=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, src_mask=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -158,6 +157,7 @@ class DeformableTransformer(nn.Module):
 
         # encoder
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+
         # prepare input for decoder
         bs, _, c = memory.shape
         if self.two_stage:
@@ -180,11 +180,10 @@ class DeformableTransformer(nn.Module):
             tgt = query_embed
             reference_points = self.reference_points(query_embed).sigmoid()
             init_reference_out = reference_points
+
         # decoder
         hs, inter_references = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index,
-                                            valid_ratios, mask_flatten,
-                                            mem_bank, mem_bank_pad_mask, attn_mask)
+                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, src_mask)
 
         inter_references_out = inter_references
         if self.two_stage:
@@ -196,18 +195,18 @@ class DeformableTransformerEncoderLayer(nn.Module):
     def __init__(self,
                  d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
-                 n_levels=4, n_heads=8, n_points=4, sigmoid_attn=False):
+                 n_levels=4, n_heads=8, n_points=4):
         super().__init__()
 
         # self attention
-        self.self_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points, sigmoid_attn=sigmoid_attn)
+        self.self_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
-        self.dropout_relu = ReLUDropout(dropout, True)
+        self.dropout2 = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout3 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
@@ -217,7 +216,7 @@ class DeformableTransformerEncoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos
 
     def forward_ffn(self, src):
-        src2 = self.linear2(self.dropout_relu(self.linear1(src)))
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
         src = src + self.dropout3(src2)
         src = self.norm2(src)
         return src
@@ -230,6 +229,7 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
         # ffn
         src = self.forward_ffn(src)
+
         return src
 
 
@@ -263,34 +263,18 @@ class DeformableTransformerEncoder(nn.Module):
         return output
 
 
-class ReLUDropout(torch.nn.Dropout):
-    def forward(self, input):
-        return relu_dropout(input, p=self.p, training=self.training, inplace=self.inplace)
-
-def relu_dropout(x, p=0, inplace=False, training=False):
-    if not training or p == 0:
-        return x.clamp_(min=0) if inplace else x.clamp(min=0)
-
-    mask = (x < 0) | (torch.rand_like(x) > 1 - p)
-    return x.masked_fill_(mask, 0).div_(1 - p) if inplace else x.masked_fill(mask, 0).div(1 - p)
-
-
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
-                 n_levels=4, n_heads=8, n_points=4, self_cross=True, sigmoid_attn=False,
-                 extra_track_attn=False, memory_bank=False):
+                 n_levels=4, n_heads=8, n_points=4):
         super().__init__()
 
-        self.self_cross = self_cross
-        self.num_head = n_heads
-        self.memory_bank = memory_bank
-
         # cross attention
-        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points, sigmoid_attn=sigmoid_attn)
+        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
+        # self attention
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
@@ -298,65 +282,28 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
-        self.dropout_relu = ReLUDropout(dropout, True)
+        self.dropout3 = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
-
-        # memory bank
-        if self.memory_bank:
-            self.temporal_attn = nn.MultiheadAttention(d_model, 8, dropout=0)
-            self.temporal_fc1 = nn.Linear(d_model, d_ffn)
-            self.temporal_fc2 = nn.Linear(d_ffn, d_model)
-            self.temporal_norm1 = nn.LayerNorm(d_model)
-            self.temporal_norm2 = nn.LayerNorm(d_model)
-
-            position = torch.arange(5).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-            pe = torch.zeros(5, 1, d_model)
-            pe[:, 0, 0::2] = torch.sin(position * div_term)
-            pe[:, 0, 1::2] = torch.cos(position * div_term)
-            self.register_buffer('pe', pe)
-
-        # update track query_embed
-        self.extra_track_attn = extra_track_attn
-        if self.extra_track_attn:
-            print('Training with Extra Self Attention in Every Decoder.', flush=True)
-            self.update_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-            self.dropout5 = nn.Dropout(dropout)
-            self.norm4 = nn.LayerNorm(d_model)
-
-        if self_cross:
-            print('Training with Self-Cross Attention.')
-        else:
-            print('Training with Cross-Self Attention.')
 
     @staticmethod
     def with_pos_embed(tensor, pos):
         return tensor if pos is None else tensor + pos
 
     def forward_ffn(self, tgt):
-        tgt2 = self.linear2(self.dropout_relu(self.linear1(tgt)))
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
         return tgt
 
-    def _forward_self_attn(self, tgt, query_pos, attn_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None, src_mask=None):
+        # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
-        if attn_mask is not None:
-            tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1),
-                                  attn_mask=attn_mask)[0].transpose(0, 1)
-        else:
-            tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
+        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), attn_mask=src_mask)[0].transpose(0, 1)
         tgt = tgt + self.dropout2(tgt2)
-        return self.norm2(tgt)
+        tgt = self.norm2(tgt)
 
-
-    def _forward_self_cross(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                            src_padding_mask=None, attn_mask=None):
-
-        # self attention
-        tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
         # cross attention
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
                                reference_points,
@@ -368,38 +315,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.forward_ffn(tgt)
 
         return tgt
-
-    def _forward_cross_self(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                            src_padding_mask=None, attn_mask=None):
-        # cross attention
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
-                               reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-        # self attention
-        tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
-        # ffn
-        tgt = self.forward_ffn(tgt)
-
-        return tgt
-
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None, mem_bank=None, mem_bank_pad_mask=None, attn_mask=None):
-        if self.self_cross:
-            return self._forward_self_cross(tgt, query_pos, reference_points, src, src_spatial_shapes,
-                                            level_start_index, src_padding_mask, attn_mask)
-        return self._forward_cross_self(tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                                        src_padding_mask, attn_mask)
-
-
-def pos2posemb(pos, num_pos_feats=64, temperature=10000):
-    scale = 2 * math.pi
-    pos = pos * scale
-    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
-    dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
-    posemb = pos[..., None] / dim_t
-    posemb = torch.stack((posemb[..., 0::2].sin(), posemb[..., 1::2].cos()), dim=-1).flatten(-3)
-    return posemb
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -413,7 +328,7 @@ class DeformableTransformerDecoder(nn.Module):
         self.class_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                src_padding_mask=None, mem_bank=None, mem_bank_pad_mask=None, attn_mask=None):
+                query_pos=None, src_padding_mask=None, src_mask=None):
         output = tgt
 
         intermediate = []
@@ -425,9 +340,7 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            query_pos = pos2posemb(reference_points)
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes,
-                           src_level_start_index, src_padding_mask, mem_bank, mem_bank_pad_mask, attn_mask)
+            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, src_mask)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
@@ -459,13 +372,12 @@ def _get_clones(module, N):
 def _get_activation_fn(activation):
     """Return an activation function given a string"""
     if activation == "relu":
-        return nn.ReLU(True)
+        return F.relu
     if activation == "gelu":
         return F.gelu
     if activation == "glu":
         return F.glu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
-
 
 
 def build_deforamble_transformer(args):
@@ -482,11 +394,4 @@ def build_deforamble_transformer(args):
         dec_n_points=args.dec_n_points,
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
-        two_stage_num_proposals=args.num_queries,
-        decoder_self_cross=not args.decoder_cross_self,
-        sigmoid_attn=args.sigmoid_attn,
-        extra_track_attn=args.extra_track_attn,
-        memory_bank=args.memory_bank_type == 'MemoryBankFeat'
-    )
-
-
+        two_stage_num_proposals=args.num_queries)
