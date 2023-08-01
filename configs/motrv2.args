@@ -6,11 +6,10 @@
 --lr 2e-4
 --lr_backbone 2e-5
 --batch_size 1
---resume /home/rickard/experiments/ultima_tracker/MOTRv2/exps/motrv2/run1/checkpoint.pth
---num_accumulate_batches 64
+--num_accumulate_batches 8
 --sample_mode random_interval
 --sample_interval 10
---sampler_lengths 5
+--sampler_lengths 6
 --merger_dropout 0
 --dropout 0
 --random_drop 0.1

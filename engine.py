@@ -59,7 +59,7 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         data_dict = data_dict_to_cuda(data_dict, device)
         losses = []
         accs = []
-        pred_accs = []
+        pred_accs = [1]
         
         training_tracker.reset()
         for i in range(len(data_dict['imgs'])):
@@ -76,74 +76,45 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
 
             # Get all indexes of unmatched proposals
             matched_proposal_boxes = torch.clamp(proposal_boxes[col], min=0, max=1)
-            matched_proposal_scores = proposal_scores[col]
-
-            if matched_proposal_boxes.shape[0] == 0:
-                print("No matched boxes")
-                break
-
-            labels = torch.zeros((matched_proposal_boxes.shape[0], 1), device=matched_proposal_boxes.device)
-
-            # Unmatched proposals. Col is a tensor of indexes of matched proposals
-            unmatched_proposal_boxes = torch.cat([
-                proposal_boxes[torch.arange(proposal_boxes.shape[0]) != c] for c in col
-            ], dim=0)
-
-            unmatched_proposal_scores = torch.cat([
-                proposal_scores[torch.arange(proposal_scores.shape[0]) != c] for c in col
-            ], dim=0)
-
-            # Sample false positives from unmatched proposals. At least 0.3 of the batch should be false positives
-            num_false_positives = unmatched_proposal_boxes.shape[0] #min(unmatched_proposal_boxes.shape[0], int(1 * matched_proposal_boxes.shape[0]))
-            false_positive_idx = torch.randperm(unmatched_proposal_boxes.shape[0])[:num_false_positives]
-
-            if false_positive_idx.shape[0] > 0 and len(training_tracker.seen) > 0:
-                matched_proposal_boxes = torch.cat([
-                    matched_proposal_boxes,
-                    unmatched_proposal_boxes[false_positive_idx]
-                ], dim=0)
-
-                matched_proposal_scores = torch.cat([
-                    matched_proposal_scores,
-                    unmatched_proposal_scores[false_positive_idx]
-                ], dim=0)
-
-                labels_fp = torch.ones((false_positive_idx.shape[0], 1), device=labels.device)
-
-                labels = torch.cat([
-                    labels,
-                    labels_fp
-                ], dim=0)
+            matched_proposal_scores = proposal_scores[col].unsqueeze(1)
             
+            if matched_proposal_boxes.shape[0] == 0:
+                continue
+
             samples = NestedTensor(
                 img.unsqueeze(0),
-                torch.zeros(img.shape[-2:], dtype=torch.bool, device=img.device).unsqueeze(0)
+                torch.zeros(img.shape[-2:], device=img.device).unsqueeze(0)
             )
 
-            if len(training_tracker.seen) == 0:
-                outputs = model(samples, matched_proposal_boxes, proposal_scores=matched_proposal_scores.unsqueeze(-1))
-                training_tracker.init_new_tracks(outputs['proposal_queries'], gt_obj_ids)
-                continue
-            
-            track_queries, track_labels = training_tracker.get_active_tracks()
-            outputs = model(samples, matched_proposal_boxes, tracks=track_queries.clone(), proposal_scores=matched_proposal_scores.unsqueeze(-1))
-            
-            outputs['proposal_queries'] = outputs['proposal_queries'][:gt_obj_ids.shape[0]] # Remove false positives            
+            proposal_queries = model(samples, proposals=matched_proposal_boxes, proposal_scores=matched_proposal_scores) 
 
-            loss, acc = criterion(track_labels, outputs['track_queries'], gt_obj_ids, outputs['proposal_queries'])#, include_unmatched=True)
-            loss_bce, pred_acc = criterion.forward_bce(outputs['proposal_logits'], labels)
-            
+            ids = gt_obj_ids.to(torch.long).tolist()
+            training_tracker.add_queries(proposal_queries, ids)
 
+        positive_data, masks, lengths = training_tracker.get_positive_data()
+        if positive_data is None:
+            continue
+        energies = model.energy_function(positive_data, masks)[:, 1:]
+        lengths = lengths - 1
+        positive_energies = torch.cat(torch.nn.utils.rnn.unpad_sequence(energies, lengths, batch_first=True))
+        
+        negative_data, masks, lengths = training_tracker.generate_negative_data()
+        if negative_data is None:
+            continue
+        energies = model.energy_function(negative_data, masks)[:, 1:]
+        lengths = lengths - 1
+        negative_energies = torch.cat(torch.nn.utils.rnn.unpad_sequence(energies, lengths, batch_first=True))
 
-            if loss is not None:
-                loss = loss + loss_bce
-                losses.append(loss)
-                accs.append(acc)
-                pred_accs.append(pred_acc)
+        hard_negative_data, masks, lengths = training_tracker.generate_hard_negative_data()
+        if hard_negative_data is not None:
+            energies = model.energy_function(hard_negative_data, masks)[:, 1:]
+            hard_negative_energies = torch.cat([x[-1].unsqueeze(1) for x in torch.nn.utils.rnn.unpad_sequence(energies, lengths, batch_first=True)])
 
-            updated_track_queries = model.query_interaction(outputs['track_queries'], track_queries)
-            training_tracker.update_tracks(updated_track_queries, track_labels)
-            training_tracker.init_new_tracks(outputs['proposal_queries'], gt_obj_ids)
+            negative_energies = torch.cat([negative_energies, hard_negative_energies])
+        
+        loss, acc = criterion(positive_energies, negative_energies)
+        losses.append(loss)
+        accs.append(acc)
 
         # print("iter {} after model".format(cnt-1))
 

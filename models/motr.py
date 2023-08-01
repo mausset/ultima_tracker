@@ -47,37 +47,124 @@ def pos2posemb(pos, num_pos_feats=64, temperature=10000):
     posemb = torch.stack((posemb[..., 0::2].sin(), posemb[..., 1::2].cos()), dim=-1).flatten(-3)
     return posemb
 
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
 
 class TrainingTracker(nn.Module):
     
-    def __init__(self) -> None:
+    def __init__(self, max_length=5) -> None:
         super().__init__()
-        self.seen = set()
         self.tracks = {}
 
     def reset(self):
         self.tracks = {}
-        self.seen = set()
+ 
+    def add_queries(self, queries, labels):
+        for query, label in zip(queries, labels):
+            if label not in self.tracks:
+                self.tracks[label] = []
+            self.tracks[label].append(query)
+    
+    def get_positive_data(self):
+        positive_data = []
+        for label, queries in self.tracks.items():
+            if len(queries) < 2:
+                continue
+            positive_data.append(torch.stack(queries))
+        
+        if len(positive_data) == 0:
+            return None, None, None
+        
+        padded_seqs = torch.nn.utils.rnn.pad_sequence(positive_data, batch_first=True)
+        masks = torch.nn.utils.rnn.pad_sequence([torch.ones_like(queries[:, 0]) for queries in positive_data], batch_first=True)
+        lengths = torch.tensor([len(queries) for queries in positive_data])
+            
+        return padded_seqs, masks, lengths
 
-    def get_active_tracks(self):
-        """ Returns the tracks that are active, in order of the labels. """
-        tracks_active = []
-        for label in sorted(self.seen):
-            track = self.tracks[label]
-            tracks_active.append(track)
-        return torch.stack(tracks_active), torch.tensor(sorted(self.seen))
+    def all_queries(self):
+        data = []
+        lengths = []
+        for label, queries in self.tracks.items():
+            data.append(torch.stack(queries))
+            lengths.append(len(queries))
+            
+        return torch.cat(data), torch.tensor(lengths)
+     
+    # NOTE: There are many ways to generate negative data.
+    # Which is optimal remains to be seen.
+    # For now, just randomly construct by sampling without replacement
+    def generate_negative_data(self):
+        positive_data, lengths = self.all_queries()
+        negative_data = []
+        total_length = positive_data.shape[0]
+        for length in lengths:
+            sampled_indexes = torch.randperm(total_length)[:length]
+            negative_data.append(positive_data[sampled_indexes])
+
+        padded_seqs = torch.nn.utils.rnn.pad_sequence(negative_data, batch_first=True)
+        masks = torch.nn.utils.rnn.pad_sequence([torch.ones_like(queries[:, 0]) for queries in negative_data], batch_first=True) 
+        return padded_seqs, masks, lengths
+
+    # Generate negatives by sampling in queries from other tracks
+    def generate_hard_negative_data(self):
+        negative_data = []
+        lengths = []
+        if len(self.tracks) < 2:
+            return None, None, None
+        for label, tmp_queries in self.tracks.items():
+            if len(tmp_queries) < 2:
+                    continue
+            for _ in range(5):
+                lengths.append(len(tmp_queries))
+
+                queries = torch.stack(tmp_queries).clone()
+                # Switch one of the queries with a query from another track
+                idx = torch.randperm(len(self.tracks))
+                sampled_label = label
+                while sampled_label == label:
+                    sampled_label = list(self.tracks.keys())[idx[0]]
+                    idx = idx[1:]
+
+                sampled_query = self.tracks[sampled_label][np.random.randint(len(self.tracks[sampled_label]))]
+                sampled_index = np.random.randint(queries.shape[0])
+                queries[sampled_index] = sampled_query
+
+                negative_data.append(queries)
+
+        if len(negative_data) == 0:
+            return None, None, None
     
-    def update_tracks(self, tracks_new, labels):
-        labels = labels.to(torch.long).tolist()
-        for label, track in zip(labels, tracks_new):
-            self.tracks[label] = track
-    
-    def init_new_tracks(self, tracks_new, labels):
-        labels = labels.to(torch.long).tolist()
-        for label, track in zip(labels, tracks_new):
-            if label not in self.seen:
-                self.tracks[label] = track
-                self.seen.add(label)
+        padded_seqs = torch.nn.utils.rnn.pad_sequence(negative_data, batch_first=True)
+        masks = torch.nn.utils.rnn.pad_sequence([torch.ones_like(queries[:, 0]) for queries in negative_data], batch_first=True)
+        lengths = torch.tensor(lengths)
+
+        return padded_seqs, masks, lengths
+
+
+
+
+
+
+        
+            
         
 class RuntimeTracker(nn.Module):
 
@@ -159,69 +246,15 @@ class ContrastiveCriterion(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.criterion = SelfSupervisedLoss(NTXentLoss())
-        self.binary_cross_entropy = nn.BCEWithLogitsLoss()
 
-    def calculate_cosine_sim_accuracy(self, track_encodings, proposal_features, return_similarities=False):
-        track_encodings = F.normalize(track_encodings, dim=-1)
-        proposal_features = F.normalize(proposal_features, dim=-1)
-
-        cosine_sim = torch.matmul(track_encodings, proposal_features.T)
-
-        # Solve the linear assignment problem using the Hungarian algorithm and get correct matches
-        cost, row, col = lap.lapjv(-cosine_sim.cpu().detach().numpy(), extend_cost=True)
-        row = torch.from_numpy(row).cuda()
-
-        correct = (row == torch.arange(row.shape[0]).cuda())
-
-        accuracy = torch.mean(correct.float())
-
-        return accuracy
-    
-    # Outputs are logits
-    def forward_bce(self, outputs, targets):
-        loss = self.binary_cross_entropy(outputs, targets)
-        acc = torch.mean(((outputs > 0) == targets).float())
-        return loss, acc
- 
-    def forward(self, track_labels, track_queries, proposal_labels, proposal_queries, include_unmatched=False):
-        track_labels = track_labels.to(torch.long)
-        proposal_labels = proposal_labels.to(torch.long)
-
-        track_labels_list = track_labels.tolist()
-        proposal_labels_list = proposal_labels.tolist()
-
-        common_labels = set(track_labels_list) & set(proposal_labels_list)
-        track_mask_common = torch.tensor([label in common_labels for label in track_labels_list], dtype=torch.bool)
-        proposal_mask_common = torch.tensor([label in common_labels for label in proposal_labels_list], dtype=torch.bool)
-
-        track_labels_common = track_labels[track_mask_common]
-        track_queries_common = track_queries[track_mask_common]
-
-        proposal_labels_common = proposal_labels[proposal_mask_common]
-        proposal_queries_common = proposal_queries[proposal_mask_common]
-
-        if track_labels_common.shape[0] != 0:
-            sorted_track_queries_common, _ = zip(*sorted(zip(track_queries_common, track_labels_common), key=lambda x: x[1]))
-            matched_track_queries = torch.stack(sorted_track_queries_common)
-        else:
-            matched_track_queries = torch.zeros((0, track_queries_common.shape[1]), dtype=track_queries_common.dtype, device=track_queries_common.device)
-
-        if proposal_labels_common.shape[0] != 0:
-            sorted_proposal_queries_common, _ = zip(*sorted(zip(proposal_queries_common, proposal_labels_common), key=lambda x: x[1]))
-            matched_proposal_queries = torch.stack(sorted_proposal_queries_common)
-        else:
-            matched_proposal_queries = torch.zeros((0, proposal_queries_common.shape[1]), dtype=proposal_queries_common.dtype, device=proposal_queries_common.device)
-        
-        if matched_track_queries.shape[0] == 0 or matched_proposal_queries.shape[0] == 0: # Just ignore
-            return None, None
-        
-        assert matched_track_queries.shape == matched_proposal_queries.shape, f"{matched_track_queries.shape} != {matched_proposal_queries.shape}"
-            
-        loss = self.criterion(matched_track_queries, matched_proposal_queries)
-        
-        acc = self.calculate_cosine_sim_accuracy(matched_track_queries, matched_proposal_queries)
-        
+    def forward(self, positive_energies, negative_energies):
+        assert positive_energies is not None or negative_energies is not None
+        positive_targets = torch.zeros((positive_energies.shape[0], 1), dtype=torch.float, device=positive_energies.device)
+        negative_targets = torch.ones((negative_energies.shape[0], 1), dtype=torch.float, device=negative_energies.device)
+        targets = torch.cat([positive_targets, negative_targets])
+        all_energies = torch.cat([positive_energies, negative_energies])
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(all_energies, targets)
+        acc = torch.mean(((all_energies > 0) == targets).float())
         return loss, acc
  
 
@@ -254,19 +287,18 @@ class MOTR(nn.Module):
             out_dim=hidden_dim
         )
 
-        self.multi_head_attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, dropout=0.1)
-        self.query_weight = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.key_weight = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.value_weight = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
-
-        self.predict_fp_tp = MLP(hidden_dim, hidden_dim, 1, 3)
+        self.positional_encoding = PositionalEncoding(hidden_dim, 0,  10)
         
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=8, 
+            norm_first=True, 
+            dim_feedforward=4*hidden_dim, 
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.projector = torch.nn.Linear(hidden_dim, 1, bias=False)
+
 
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -295,24 +327,14 @@ class MOTR(nn.Module):
     def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None):
         raise NotImplementedError()
     
-    def query_interaction(self, tracks_new, tracks_old):
-        x = tracks_new + tracks_old
-        q = self.query_weight(x)
-        k = self.key_weight(x)
-        v = self.value_weight(tracks_new)
-
-        x = self.multi_head_attention(q[:, None], k[:, None], value=v[:, None])[0][:, 0]
-        x = x + tracks_new
-
-        x1 = self.layer_norm(x)
-
-        x = self.ffn(x1)
-        x = x + x1
-        x = self.layer_norm(x)
-
+    def energy_function(self, x, padding_mask):
+        causal_mask = torch.triu(torch.ones((x.shape[1], x.shape[1])), diagonal=1).to(x.device)
+        x = self.positional_encoding(x)
+        x = self.encoder(x, mask=causal_mask, is_causal=True, src_key_padding_mask=padding_mask)
+        x = self.projector(x)
         return x
-
-    def forward(self, samples: NestedTensor, proposals, tracks=None, proposal_scores=None):
+    
+    def forward(self, samples: NestedTensor, proposals, proposal_scores=None):
         features, pos = self.backbone(samples)
         src, mask = features[-1].decompose()
         assert mask is not None
@@ -340,39 +362,21 @@ class MOTR(nn.Module):
                 pos.append(pos_l)
 
         
-        proposals = self.proposal_embed(proposals)
+        proposal_query = self.proposal_embed(proposals)
         if proposal_scores is not None:
-            proposals = proposals + pos2posemb(proposal_scores, num_pos_feats=proposals.shape[-1])
+            proposal_query = proposal_query + pos2posemb(proposal_scores, num_pos_feats=proposal_query.shape[-1])
+        
+        reference_points = proposals
 
-        query_embed = proposals
         mask = None
 
-        if tracks is not None:
-            query_embed = torch.cat([query_embed, tracks], dim=0)
-            # mask = torch.zeros((query_embed.shape[0], query_embed.shape[0]), dtype=torch.bool, device=query_embed.device)
-            # mask[:proposals.shape[0], proposals.shape[0]:] = True
-            # mask[proposals.shape[0]:, :proposals.shape[0]] = True
-
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-            self.transformer(srcs, masks, pos, query_embed, src_mask=mask) 
+            self.transformer(srcs, masks, pos, proposal_query, ref_pts=reference_points, src_mask=mask) 
 
         proposal_queries = hs[-1, 0, :proposals.shape[0]]
 
-        proposal_logits = self.predict_fp_tp(proposal_queries)
-
-
-        out = {
-            'proposal_queries': proposal_queries,
-            'proposal_logits': proposal_logits,
-            'track_queries': None,
-        }
-
-        if tracks is not None:
-            track_queries = hs[-1, 0, proposals.shape[0]:]
-            out['track_queries'] = track_queries
-            out['track_logits'] = self.predict_fp_tp(track_queries)
          
-        return out
+        return proposal_queries
 
 
 def build(args):
