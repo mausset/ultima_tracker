@@ -229,17 +229,10 @@ class Detector(object):
 
             track_ids, track_queries = self.tracker.get_tracks()
 
-            res = self.detr(samples, proposals, tracks=track_queries, proposal_scores=proposal_scores)
-
-            proposal_queries = res['proposal_queries']
-            updated_track_queries = res['track_queries']
+            res = self.detr(samples, proposals, proposal_scores=proposal_scores)
 
             identities = self.tracker.get_assigments(proposal_queries, updated_track_queries, track_ids)
-
-            if track_queries is not None:
-                updated_track_queries = self.detr.query_interaction(updated_track_queries, track_queries)
-                self.tracker.update_tracks(track_ids, updated_track_queries)
-            
+ 
             self.tracker.cull_tracks()
 
             bbox_xyxy = normalized_to_pixel_coordinates(proposals, seq_h, seq_w)
@@ -254,32 +247,6 @@ class Detector(object):
 
         with open(os.path.join(self.predict_path, f'{self.seq_num}.txt'), 'w') as f:
             f.writelines(lines)
-
-# class RuntimeTrackerBase(object):
-#     def __init__(self, score_thresh=0.6, filter_score_thresh=0.5, miss_tolerance=10):
-#         self.score_thresh = score_thresh
-#         self.filter_score_thresh = filter_score_thresh
-#         self.miss_tolerance = miss_tolerance
-#         self.max_obj_id = 0
-
-#     def clear(self):
-#         self.max_obj_id = 0
-
-#     def update(self, track_instances: Instances):
-#         device = track_instances.obj_idxes.device
-
-#         track_instances.disappear_time[track_instances.scores >= self.score_thresh] = 0
-#         new_obj = (track_instances.obj_idxes == -1) & (track_instances.scores >= self.score_thresh)
-#         disappeared_obj = (track_instances.obj_idxes >= 0) & (track_instances.scores < self.filter_score_thresh)
-#         num_new_objs = new_obj.sum().item()
-
-#         track_instances.obj_idxes[new_obj] = self.max_obj_id + torch.arange(num_new_objs, device=device)
-#         self.max_obj_id += num_new_objs
-
-#         track_instances.disappear_time[disappeared_obj] += 1
-#         to_del = disappeared_obj & (track_instances.disappear_time >= self.miss_tolerance)
-#         track_instances.obj_idxes[to_del] = -1
-
 
 if __name__ == '__main__':
 
