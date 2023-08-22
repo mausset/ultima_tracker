@@ -257,17 +257,18 @@ def make_transforms_for_mot17(image_set, args=None):
         T.MotToTensor(),
         T.MotNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    scales = [608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992]
+    # scales = [608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992]
+    scales = [800]
 
     if image_set == 'train':
         return T.MotCompose([
             T.MotRandomHorizontalFlip(),
             T.MotRandomSelect(
-                T.MotRandomResize(scales, max_size=1536),
+                T.MotRandomResize(scales, max_size=1333),
                 T.MotCompose([
                     T.MotRandomResize([800, 1000, 1200]),
                     T.FixedMotRandomCrop(800, 1200),
-                    T.MotRandomResize(scales, max_size=1536),
+                    T.MotRandomResize(scales, max_size=1333),
                 ])
             ),
             T.MOTHSV(),

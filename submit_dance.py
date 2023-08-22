@@ -24,11 +24,14 @@ from pathlib import Path
 from models import build_model
 from util.tool import load_model
 from main import get_args_parser
+import time
 
 from models.structures import Instances
 from torch.utils.data import Dataset, DataLoader
 from util.misc import NestedTensor
 from util.box_ops import box_cxcywh_to_xyxy
+
+from einops import rearrange, repeat
 
 class ListImgDataset(Dataset):
     def __init__(self, mot_path, img_list, det_db) -> None:
@@ -41,7 +44,7 @@ class ListImgDataset(Dataset):
         common settings
         '''
         self.img_height = 800
-        self.img_width = 1536
+        self.img_width = 1333 #1536
         self.mean = [0.485, 0.456, 0.406]
         self.std = [0.229, 0.224, 0.225]
 
@@ -91,6 +94,7 @@ class RuntimeTracker(nn.Module):
         self.time_since_seen = {}
         self.tracks = {}
         self.max_id = 0
+        self.max_context = 25 - 1
 
     def reset(self):
         self.time_since_seen = {}
@@ -100,7 +104,7 @@ class RuntimeTracker(nn.Module):
     def _init_fresh_tracks(self, proposal_queries):
         assigned_ids = []
         for proposal_query in proposal_queries:
-            self.tracks[self.max_id] = proposal_query
+            self.tracks[self.max_id] = [proposal_query]
             self.time_since_seen[self.max_id] = 0
             assigned_ids.append(self.max_id)
             self.max_id += 1
@@ -111,50 +115,34 @@ class RuntimeTracker(nn.Module):
         if self.max_id == 0:
             return None, None
         track_ids, tracks = zip(*self.tracks.items())
-        tracks = [track.cuda() for track in tracks]
-        tracks = torch.stack(tracks).clone() # Make sure not to modify the original tracks, not sure if this is necessary
+        tracks = [torch.stack(track[-self.max_context:]).clone() for track in tracks]
 
         return track_ids, tracks
-
-    def _cosine_sim(self, track_queries, proposal_queries):
-        track_queries = normalize(track_queries, dim=-1)
-        proposal_queries = normalize(proposal_queries, dim=-1)
-
-        cosine_sim = torch.matmul(track_queries, proposal_queries.T)
-
-        return cosine_sim
-    
-    def get_assigments(self, proposal_queries, track_queries=None, track_ids=None):
-        if track_queries is None:
+ 
+    def get_assigments(self, sim_matrix, track_ids, proposal_queries):
+        if len(self.tracks) == 0:
             return self._init_fresh_tracks(proposal_queries)
         
-        proposal_queries = proposal_queries.cpu() 
-        track_queries = track_queries.cpu()
-
-        cosine_sim = self._cosine_sim(track_queries, proposal_queries)
-
         # Solve the linear assignment problem using the Hungarian algorithm and get correct matches
-        cost, row, col = lap.lapjv(-cosine_sim.numpy(), extend_cost=True, cost_limit=-self.similarity_threshold)
+        cost, row, col = lap.lapjv(sim_matrix.numpy(), extend_cost=True, cost_limit=self.similarity_threshold)
 
         for identity, r in zip(track_ids, row):
             if r == -1:
+                self.tracks[identity].append(torch.zeros((256,), device=proposal_queries.device))
                 self.time_since_seen[identity] += 1
                 continue
             self.time_since_seen[identity] = 0
+            self.tracks[identity].append(proposal_queries[r])
 
         for i, (proposal, c) in enumerate(zip(proposal_queries, col)):
             if c == -1:
-                self.tracks[self.max_id] = proposal
+                self.tracks[self.max_id] = [proposal]
                 self.time_since_seen[self.max_id] = 0
                 col[i] = self.max_id
                 self.max_id += 1
             
         return col
     
-    def update_tracks(self, track_ids, updated_track_queries):
-        for track_id, track in zip(track_ids, updated_track_queries):
-            self.tracks[track_id] = track 
-
     def cull_tracks(self):
         for track_id in list(self.tracks.keys()):
             if self.time_since_seen[track_id] > self.miss_tolerance:
@@ -203,7 +191,22 @@ class Detector(object):
         keep = areas > area_threshold
         return dt_instances[keep]
 
-    def detect(self, prob_threshold=0.6, area_threshold=100, vis=False):
+    def get_similarity_matrix(self, tracks: list[torch.tensor], proposals: torch.tensor) -> torch.Tensor:
+        lengths = torch.tensor([[track.shape[0]+1]*proposals.shape[0] for track in tracks], dtype=torch.long).flatten()
+        tracks = [repeat(track, 'n d -> b n d', b=proposals.shape[0]) for track in tracks]
+        proposals = rearrange(proposals, '(b n) d -> b n d', n=1)
+        
+        potentials = [torch.cat([track, proposals], dim=1) for track in tracks]
+        potentials = [torch.nn.functional.pad(potential, (0, 0, 0, lengths.max() - potential.shape[1], 0, 0)) for potential in potentials]
+        potentials = torch.cat(potentials, dim=0)
+         
+        logits = self.detr.energy_function(potentials).sigmoid()
+        logits = torch.tensor([x[-1] for x in torch.nn.utils.rnn.unpad_sequence(logits, lengths=lengths, batch_first=True)])
+        sim_matrix = rearrange(logits, '(t p) -> t p', t=len(tracks), p=proposals.shape[0])
+
+        return sim_matrix
+
+    def detect(self, prob_threshold=0.5, area_threshold=100, vis=False):
         total_dts = 0
         total_occlusion_dts = 0
 
@@ -227,31 +230,35 @@ class Detector(object):
                 torch.zeros((seq_h, seq_w), dtype=torch.bool, device=cur_img.device).unsqueeze(0)
             )
 
-            track_ids, track_queries = self.tracker.get_tracks()
+            proposal_queries = self.detr(samples, proposals.unsqueeze(0), proposal_scores=proposal_scores).squeeze(0)
+                         
+            track_ids, tracks = self.tracker.get_tracks()
+            if tracks is None:
+                identities = self.tracker._init_fresh_tracks(proposal_queries)
+            else:
+                sim_matrix = self.get_similarity_matrix(tracks, proposal_queries)
+                identities = self.tracker.get_assigments(sim_matrix, track_ids, proposal_queries)
 
-            res = self.detr(samples, proposals, proposal_scores=proposal_scores)
-
-            identities = self.tracker.get_assigments(proposal_queries, updated_track_queries, track_ids)
- 
             self.tracker.cull_tracks()
 
             bbox_xyxy = normalized_to_pixel_coordinates(proposals, seq_h, seq_w)
             save_format = '{frame},{id},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},1,-1,-1,-1\n'
-            for xyxy, track_id in zip(bbox_xyxy, identities):
-                if track_id < 0 or track_id is None:
+            for xyxy, proposal_id in zip(bbox_xyxy, identities):
+                if proposal_id < 0 or proposal_id is None:
                     continue
                 x1, y1, x2, y2 = xyxy
                 w, h = x2 - x1, y2 - y1
-                lines.append(save_format.format(frame=i + 1, id=track_id, x1=x1, y1=y1, w=w, h=h))
+                lines.append(save_format.format(frame=i + 1, id=proposal_id, x1=x1, y1=y1, w=w, h=h))
         
-
         with open(os.path.join(self.predict_path, f'{self.seq_num}.txt'), 'w') as f:
             f.writelines(lines)
 
 if __name__ == '__main__':
+    
+    torch.set_printoptions(precision=2, linewidth=200, sci_mode=False)
 
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    parser.add_argument('--score_threshold', default=0.3, type=float)
+    parser.add_argument('--score_threshold', default=0.5, type=float)
     parser.add_argument('--update_score_threshold', default=0.5, type=float)
     parser.add_argument('--miss_tolerance', default=20, type=int)
     args = parser.parse_args()
@@ -261,7 +268,7 @@ if __name__ == '__main__':
     # load model and weights
     detr, _, _ = build_model(args)
     # detr.track_embed.score_thr = args.update_score_threshold
-    tracker = RuntimeTracker(0.5, args.miss_tolerance)
+    tracker = RuntimeTracker(0.31, args.miss_tolerance)
     # detr.track_base = RuntimeTracker(args.score_threshold, args.miss_tolerance)
     checkpoint = torch.load(args.resume, map_location='cpu')
     # detr = load_model(detr, args.resume)

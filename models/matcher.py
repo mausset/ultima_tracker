@@ -13,7 +13,7 @@
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
 import torch
-from scipy.optimize import linear_sum_assignment
+import lap
 from torch import nn
 
 from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
@@ -28,8 +28,9 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self):
+    def __init__(self, iou_threshold=0.5):
         super().__init__()
+        self.iou_threshold = iou_threshold
 
     def forward(self, target_bbox, proposal_bbox):
         """ Performs the matching
@@ -47,12 +48,8 @@ class HungarianMatcher(nn.Module):
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
         with torch.no_grad():
-
-
-
             # Compute the IoU
             cost_iou = -box_iou(target_bbox, proposal_bbox)[0]
-
 
             # TODO: Look into this
             # # Compute the giou cost betwen boxes
@@ -60,13 +57,11 @@ class HungarianMatcher(nn.Module):
             #                                  box_cxcywh_to_xyxy(tgt_bbox))
 
             # Final cost matrix
-            C = cost_iou.cpu()
+            C = cost_iou.cpu().numpy()
 
-
-            row, col = linear_sum_assignment(C)
-            indices = [(torch.as_tensor(row, dtype=torch.int64), torch.as_tensor(col, dtype=torch.int64))]
-            return indices
+            cost, row, col = lap.lapjv(C, cost_limit=-self.iou_threshold, extend_cost=True)
+            return torch.as_tensor(row, dtype=torch.int64), torch.as_tensor(col, dtype=torch.int64)
 
 
 def build_matcher(args):
-    return HungarianMatcher()
+    return HungarianMatcher(args.iou_threshold)

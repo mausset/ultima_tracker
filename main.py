@@ -26,6 +26,7 @@ import datasets.samplers as samplers
 from datasets import build_dataset
 from engine import train_one_epoch_mot
 from models import build_model
+from models.matcher import build_matcher
 
 
 def get_args_parser():
@@ -71,12 +72,15 @@ def get_args_parser():
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float,
                         help="position / size * scale")
     parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
+    parser.add_argument('--iou_threshold', default=0.5, type=float, help='iou threshold for matching')
 
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
+    parser.add_argument('--energy_layers', default=6, type=int,
+                        help="Number of energy layers in the transformer")
     parser.add_argument('--dim_feedforward', default=1024, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
     parser.add_argument('--hidden_dim', default=256, type=int,
@@ -198,6 +202,7 @@ def main(args):
     random.seed(seed)
 
     model, criterion, postprocessors = build_model(args)
+    matcher = build_matcher(args)
     model.to(device)
 
     model_without_ddp = model
@@ -306,7 +311,7 @@ def main(args):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch_mot(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args.num_accumulate_batches)
+            model, criterion, data_loader_train, optimizer, matcher, device, epoch, args.clip_max_norm, args.num_accumulate_batches)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']

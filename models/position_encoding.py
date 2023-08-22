@@ -55,12 +55,12 @@ class PositionEmebeddingFourierLearned(nn.Module):
             x (torch.Tensor): Bounding boxes to be embedded. Shape (N_tracks, self.context_dim, 4).
         """
         
-        x = rearrange(x, 'n (g m) -> n g m', g=2)
+        x = rearrange(x, 'b n (g m) -> b n g m', g=2)
         x = self._pe_encoding(x)
 
         x = self.ffn(x)
 
-        x = rearrange(x, 'n g m -> n (g m)')
+        x = rearrange(x, 'b n g m -> b n (g m)')
 
         return x
 

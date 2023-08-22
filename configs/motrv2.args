@@ -7,9 +7,13 @@
 --lr_backbone 2e-5
 --batch_size 1
 --num_accumulate_batches 8
+--enc_layers 6
+--dec_layers 6
+--energy_layers 6
+--iou_threshold 0.5
 --sample_mode random_interval
 --sample_interval 10
---sampler_lengths 6
+--sampler_lengths 25
 --merger_dropout 0
 --dropout 0
 --random_drop 0.1
@@ -17,6 +21,7 @@
 --query_interaction_layer QIMv2
 --query_denoise 0.05
 --num_queries 10
+--num_feature_levels 1
 --append_crowd
 --mot_path /home/rickard/experiments/ultima_tracker/MOTRv2/data/Dataset/mot
 --det_db det_db_motrv2.json
