@@ -75,58 +75,34 @@ class TrainingTracker(nn.Module):
         observation_masks = torch.stack([torch.tensor(observation_mask) for observation_mask in self.observation_mask.values()]).bool()
 
         return tracks.clone(), observation_masks.clone()
-          
-    def generate_negative_data(self):
-        tracks, observation_masks = self.get_tracks()
-        shuffled_mask = torch.zeros_like(observation_masks).bool() # Indicates whether a track has been shuffled for and after a given time step
-        n_time_steps_to_shuffle = np.random.randint(1, 5)
-        chosen_time_steps = np.random.choice(tracks.shape[1], n_time_steps_to_shuffle, replace=False)
-        
-        for time_step in chosen_time_steps:
-            idxs = torch.randperm(tracks.shape[0])
-            permuted_idxs = idxs != torch.arange(tracks.shape[0])
-            shuffled_mask[permuted_idxs, time_step:] = 1
-            tracks[:, time_step] = tracks[idxs, time_step]
-            observation_masks[:, time_step] = observation_masks[idxs, time_step]
-        
-        observation_masks = observation_masks & shuffled_mask
-        
-        return tracks, observation_masks
-
-    def generate_n_batch_negative_data(self, n=5):
-        generated_tracks = []
-        generated_observation_masks = []
-
-        for _ in range(n):
-            tracks, observation_masks = self.generate_negative_data()
-            generated_tracks.append(tracks)
-            generated_observation_masks.append(observation_masks)
-
-        return torch.cat(generated_tracks), torch.cat(generated_observation_masks)
-
 
 class ContrastiveCriterion(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.loss_fn = SelfSupervisedLoss(NTXentLoss())
+    
+    def cosine_sim_accuracy(self, x, y):
+        x = F.normalize(x, dim=-1)
+        y = F.normalize(y, dim=-1)
+        cosine_sim = torch.matmul(x, y.T)
 
-    def forward(self, positive_energies, negative_energies):
-        assert positive_energies is not None or negative_energies is not None
-        positive_targets = torch.zeros((positive_energies.shape[0], 1), dtype=torch.float, device=positive_energies.device)
-        negative_targets = torch.ones((negative_energies.shape[0], 1), dtype=torch.float, device=negative_energies.device)
-        targets = torch.cat([positive_targets, negative_targets])
-        all_energies = torch.cat([positive_energies, negative_energies])
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(all_energies, targets)
-        acc = torch.mean(((all_energies > 0) == targets).float())
+        _, row, _ = lap.lapjv(1 - cosine_sim.cpu().numpy())
+
+        return (torch.tensor(row).to(x.device) == torch.arange(x.shape[0]).to(x.device)).float().mean()
+
+    def forward(self, predictions, targets):
+        loss = self.loss_fn(predictions, ref_embed=targets)
+        acc = self.cosine_sim_accuracy(predictions, targets)
+
         return loss, acc
- 
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 class MOTR(nn.Module):
 
-    def __init__(self, backbone, enc_layers=6, dec_layers=6, energy_layers=6, hidden_dim=256):
+    def __init__(self, backbone, enc_layers=6, dec_layers=6, predictor_layers=6, hidden_dim=256):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -163,15 +139,14 @@ class MOTR(nn.Module):
         )
         self.proposal_decoder = nn.TransformerDecoder(proposal_decoder_layer, num_layers=dec_layers)
         
-        energy_encoder_layer = nn.TransformerEncoderLayer(
+        predictor_encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 
             nhead=8, 
             norm_first=True, 
             dim_feedforward=4*hidden_dim, 
             batch_first=True
         )
-        self.energy_encoder = nn.TransformerEncoder(energy_encoder_layer, num_layers=energy_layers)
-        self.projector = torch.nn.Linear(hidden_dim, 1, bias=False)
+        self.predictor_encoder = nn.TransformerEncoder(predictor_encoder_layer, num_layers=predictor_layers)
     
     def image_feature_grid(self, feature_shape):
         h, w = feature_shape
@@ -184,12 +159,10 @@ class MOTR(nn.Module):
 
         return torch.stack((xx, yy, xx+height, yy+width), dim=-1)
         
-
-    def energy_function(self, x):
+    def predictor(self, x):
         causal_mask = torch.triu(torch.ones((x.shape[1], x.shape[1])), diagonal=1).to(x.device).bool() 
         x = self.query_pos_enc(x)
-        x = self.energy_encoder(x, mask=causal_mask, is_causal=True)
-        x = self.projector(x)
+        x = self.predictor_encoder(x, mask=causal_mask, is_causal=True)
         return x
     
     def forward(self, samples: NestedTensor, proposals, proposal_scores, tgt_key_padding_mask=None):
@@ -221,7 +194,7 @@ def build(args):
         backbone,
         enc_layers=args.enc_layers,
         dec_layers=args.dec_layers,
-        energy_layers=args.energy_layers,
+        predictor_layers=args.energy_layers,
     )
 
     return model, criterion, None

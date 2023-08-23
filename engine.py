@@ -118,24 +118,28 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         for q, ids in zip(unpadded_queries, gt_ids):
             training_tracker.update(q, ids)
         
-        positive_data, observation_mask = training_tracker.get_tracks() 
-        with autocast(dtype=torch.bfloat16):
-            positive_energy = model.energy_function(positive_data)
-        positive_energy = positive_energy[observation_mask].view(-1, 1)
+        tracks, observation_mask = training_tracker.get_tracks() 
 
-        negative_data, observation_mask = training_tracker.generate_n_batch_negative_data(n=5)  
         with autocast(dtype=torch.bfloat16):
-            negative_energy = model.energy_function(negative_data)
-        negative_energy = negative_energy[observation_mask].view(-1, 1)
- 
-        mean_positive_logit = positive_energy.clone().sigmoid().mean()
-        mean_negative_logit = negative_energy.clone().sigmoid().mean()
+            predictions = model.predictor(tracks)
         
-        if torch.isnan(mean_negative_logit):
-            mean_negative_logit = 0
+        delta_mask = observation_mask[:, 1:] & observation_mask[:, :-1]
+
+        predictions = predictions[:, :-1][delta_mask]
+        targets = tracks[:, 1:][delta_mask]
         
         with autocast(dtype=torch.bfloat16):
-            loss, acc = criterion(positive_energy, negative_energy)
+            losses = []
+            accs = []
+            for p, t, m, in zip(predictions, targets, delta_mask): 
+                p = p[m]
+                t = t[m]
+                l, a = criterion(p, t)
+                losses.append(l)
+                accs.append(a)
+            loss = torch.stack(losses).mean()
+            acc = torch.stack(accs).mean()
+
         loss_value = loss.item()
         
         loss = loss / num_accumulate_batches
@@ -157,8 +161,6 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
         metric_logger.update(acc=acc_value)
-        metric_logger.update(mpl=mean_positive_logit)
-        metric_logger.update(mnl=mean_negative_logit)
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)

@@ -9,7 +9,7 @@
 --num_accumulate_batches 8
 --enc_layers 6
 --dec_layers 6
---energy_layers 6
+--predictor_layers 6
 --iou_threshold 0.5
 --sample_mode random_interval
 --sample_interval 10

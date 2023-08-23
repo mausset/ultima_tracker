@@ -130,18 +130,20 @@ class RuntimeTracker(nn.Module):
             if r == -1:
                 self.tracks[identity].append(torch.zeros((256,), device=proposal_queries.device))
                 self.time_since_seen[identity] += 1
-                continue
-            self.time_since_seen[identity] = 0
-            self.tracks[identity].append(proposal_queries[r])
+            else:
+                self.time_since_seen[identity] = 0
+                self.tracks[identity].append(proposal_queries[r])
 
         for i, (proposal, c) in enumerate(zip(proposal_queries, col)):
             if c == -1:
                 self.tracks[self.max_id] = [proposal]
                 self.time_since_seen[self.max_id] = 0
-                col[i] = self.max_id
+                col[i] = self.max_id 
                 self.max_id += 1
+            else:
+                col[i] = track_ids[c]
             
-        return col
+        return col # TODO: This is wrong.
     
     def cull_tracks(self):
         for track_id in list(self.tracks.keys()):
@@ -192,19 +194,11 @@ class Detector(object):
         return dt_instances[keep]
 
     def get_similarity_matrix(self, tracks: list[torch.tensor], proposals: torch.tensor) -> torch.Tensor:
-        lengths = torch.tensor([[track.shape[0]+1]*proposals.shape[0] for track in tracks], dtype=torch.long).flatten()
-        tracks = [repeat(track, 'n d -> b n d', b=proposals.shape[0]) for track in tracks]
-        proposals = rearrange(proposals, '(b n) d -> b n d', n=1)
-        
-        potentials = [torch.cat([track, proposals], dim=1) for track in tracks]
-        potentials = [torch.nn.functional.pad(potential, (0, 0, 0, lengths.max() - potential.shape[1], 0, 0)) for potential in potentials]
-        potentials = torch.cat(potentials, dim=0)
-         
-        logits = self.detr.energy_function(potentials).sigmoid()
-        logits = torch.tensor([x[-1] for x in torch.nn.utils.rnn.unpad_sequence(logits, lengths=lengths, batch_first=True)])
-        sim_matrix = rearrange(logits, '(t p) -> t p', t=len(tracks), p=proposals.shape[0])
+        padded_tracks = torch.nn.utils.rnn.pad_sequence(tracks, batch_first=True)
+        predictions = self.detr.predictor(padded_tracks)
 
-        return sim_matrix
+        
+        return torch.matmul(normalize(predictions, dim=-1), normalize(proposals, dim=-1).T)
 
     def detect(self, prob_threshold=0.5, area_threshold=100, vis=False):
         total_dts = 0
