@@ -18,6 +18,7 @@ from torch.nn.functional import normalize
 import torch
 import torch.nn as nn
 import lap
+import numpy as np
 import cv2
 from tqdm import tqdm
 from pathlib import Path
@@ -134,6 +135,7 @@ class RuntimeTracker(nn.Module):
                 self.time_since_seen[identity] = 0
                 self.tracks[identity].append(proposal_queries[r])
 
+        assigned_ids = 
         for i, (proposal, c) in enumerate(zip(proposal_queries, col)):
             if c == -1:
                 self.tracks[self.max_id] = [proposal]
