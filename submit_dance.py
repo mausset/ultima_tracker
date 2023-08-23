@@ -128,8 +128,8 @@ class RuntimeTracker(nn.Module):
 
         for identity, r in zip(track_ids, row):
             if r == -1:
-                self.tracks[identity].append(torch.zeros((256,), device=proposal_queries.device))
                 self.time_since_seen[identity] += 1
+                self.tracks[identity].append(torch.zeros((256,), device=proposal_queries.device))
             else:
                 self.time_since_seen[identity] = 0
                 self.tracks[identity].append(proposal_queries[r])
