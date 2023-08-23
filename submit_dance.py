@@ -143,7 +143,7 @@ class RuntimeTracker(nn.Module):
             else:
                 col[i] = track_ids[c]
             
-        return col # TODO: This is wrong.
+        return col
     
     def cull_tracks(self):
         for track_id in list(self.tracks.keys()):
