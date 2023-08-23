@@ -135,17 +135,17 @@ class RuntimeTracker(nn.Module):
                 self.time_since_seen[identity] = 0
                 self.tracks[identity].append(proposal_queries[r])
 
-        assigned_ids = 
+        assigned_ids = np.zeros_like(col) - 1
         for i, (proposal, c) in enumerate(zip(proposal_queries, col)):
             if c == -1:
                 self.tracks[self.max_id] = [proposal]
                 self.time_since_seen[self.max_id] = 0
-                col[i] = self.max_id 
+                assigned_ids[i] = self.max_id 
                 self.max_id += 1
             else:
-                col[i] = track_ids[c]
+                assigned_ids[i] = track_ids[c]
             
-        return col
+        return assigned_ids
     
     def cull_tracks(self):
         for track_id in list(self.tracks.keys()):
@@ -198,8 +198,7 @@ class Detector(object):
     def get_similarity_matrix(self, tracks: list[torch.tensor], proposals: torch.tensor) -> torch.Tensor:
         padded_tracks = torch.nn.utils.rnn.pad_sequence(tracks, batch_first=True)
         predictions = self.detr.predictor(padded_tracks)
-
-        
+ 
         return torch.matmul(normalize(predictions, dim=-1), normalize(proposals, dim=-1).T)
 
     def detect(self, prob_threshold=0.5, area_threshold=100, vis=False):
