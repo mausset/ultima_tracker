@@ -83,19 +83,21 @@ class ContrastiveCriterion(nn.Module):
         self.loss_fn = SelfSupervisedLoss(NTXentLoss())
     
     def cosine_sim_accuracy(self, x, y):
+        x = x.to(torch.float32)
+        y = y.to(torch.float32)
+
         x = F.normalize(x, dim=-1)
         y = F.normalize(y, dim=-1)
-        cosine_sim = torch.matmul(x, y.T)
+        cosine_sim = torch.matmul(x, y.T).detach().cpu().numpy()
 
-        _, row, _ = lap.lapjv(1 - cosine_sim.cpu().numpy())
+        _, row, _ = lap.lapjv(1 - cosine_sim)
 
         return (torch.tensor(row).to(x.device) == torch.arange(x.shape[0]).to(x.device)).float().mean()
 
     def forward(self, predictions, targets):
-        loss = self.loss_fn(predictions, ref_embed=targets)
-        acc = self.cosine_sim_accuracy(predictions, targets)
+        loss = self.loss_fn(predictions, ref_emb=targets)
 
-        return loss, acc
+        return loss
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -194,7 +196,7 @@ def build(args):
         backbone,
         enc_layers=args.enc_layers,
         dec_layers=args.dec_layers,
-        predictor_layers=args.energy_layers,
+        predictor_layers=args.predictor_layers,
     )
 
     return model, criterion, None

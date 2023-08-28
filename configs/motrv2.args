@@ -11,6 +11,8 @@
 --dec_layers 6
 --predictor_layers 6
 --iou_threshold 0.5
+--resume /home/rickard/experiments/ultima_tracker/MOTRv2/exps/motrv2/run3/checkpoint.pth
+--seed 69
 --sample_mode random_interval
 --sample_interval 10
 --sampler_lengths 25
