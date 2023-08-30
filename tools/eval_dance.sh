@@ -9,6 +9,7 @@ set -x
 set -o pipefail
 
 OUTPUT_DIR=$1
+ASSOCIATION_THRESHOLD=$2
 
 # clean up *.pyc files
 rmpyc() {
@@ -16,14 +17,13 @@ rmpyc() {
   rm -rf $(find -name "*.pyc")
 }
 
-
 cp submit_dance.py $OUTPUT_DIR
 
 pushd $OUTPUT_DIR
 
 args=$(cat *.args)
 # rlaunch --cpu 8 --gpu 1 --memory 24000 --positive-tags 2080ti -P 13 -- python3 submit_dance.py ${args} --resume checkpoint.pth --exp_name tracker
-python3 submit_dance.py ${args} --resume checkpoint.pth --exp_name tracker
+python3 submit_dance.py ${args} --association_threshold $ASSOCIATION_THRESHOLD --resume checkpoint.pth --exp_name tracker
 
 popd
 
