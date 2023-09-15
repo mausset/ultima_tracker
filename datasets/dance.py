@@ -41,6 +41,7 @@ class DetMOTDetection:
         self.sample_interval = args.sample_interval
         self.video_dict = {}
         self.mot_path = args.mot_path
+        self.MOT17 = True
 
         self.labels_full = defaultdict(lambda : defaultdict(list))
         def add_mot_folder(split_dir):
@@ -65,7 +66,11 @@ class DetMOTDetection:
                     x, y, w, h = map(float, (xywh))
                     self.labels_full[vid][t].append([x, y, w, h, i, crowd])
 
-        add_mot_folder("DanceTrack/train")
+        if self.MOT17:
+            add_mot_folder("MOT17/train")
+        else:
+            add_mot_folder("DanceTrack/train")
+            add_mot_folder("DanceTrack/val")
         vid_files = list(self.labels_full.keys())
 
         self.indices = []
@@ -159,7 +164,10 @@ class DetMOTDetection:
         return rs([img], [target])
 
     def _pre_single_frame(self, vid, idx: int):
-        img_path = os.path.join(self.mot_path, vid, 'img1', f'{idx:08d}.jpg')
+        if self.MOT17:
+            img_path = os.path.join(self.mot_path, vid, 'img1', f'{idx:06d}.jpg')
+        else:
+            img_path = os.path.join(self.mot_path, vid, 'img1', f'{idx:08d}.jpg')
         img = Image.open(img_path)
         targets = {}
         w, h = img._size
@@ -182,7 +190,12 @@ class DetMOTDetection:
             targets['labels'].append(0)
             targets['obj_ids'].append(id + obj_idx_offset)
             targets['scores'].append(1.)
-        txt_key = os.path.join(vid, 'img1', f'{idx:08d}.txt')
+        
+        if self.MOT17:
+            txt_key = os.path.join(vid, 'img1', f'{idx:06d}.txt')
+            txt_key = txt_key.replace('MOT17/', 'MOT17/images/')
+        else:
+            txt_key = os.path.join(vid, 'img1', f'{idx:08d}.txt')
         for line in self.det_db[txt_key]:
             *box, s = map(float, line.split(','))
             targets['boxes'].append(box)
@@ -258,6 +271,7 @@ def make_transforms_for_mot17(image_set, args=None):
         T.MotNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     # scales = [608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992]
+    #scales = [608, 640, 672, 704, 736, 768, 800]
     scales = [800]
 
     if image_set == 'train':

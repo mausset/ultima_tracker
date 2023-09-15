@@ -26,22 +26,26 @@ class PositionEmebeddingFourierLearned(nn.Module):
     NOTE: In the case of bounding boxes, the coordinates are considered in groups of 2 (x, y).
     """
 
-    def __init__(self, num_pos_feats: int = 64, out_dim: int = 256, scale = None) -> None:
+    def __init__(self, num_pos_feats: int = 64, out_dim: int = 256, decompose_feats=2, scale = None) -> None:
         super().__init__()
         if scale is None or scale <= 0.0:
             scale = 1.0
+        
+        self.num_pos_feats = num_pos_feats
+        self.out_dim = out_dim
+        self.decompose_feats = decompose_feats
 
-        self.positional_encoding_gaussian = nn.Parameter(scale * torch.randn((2, num_pos_feats)))
+        self.positional_encoding_gaussian = nn.Parameter(scale * torch.randn((self.decompose_feats, num_pos_feats)))
 
         self.ffn = nn.Sequential(
             nn.Linear(2*num_pos_feats, num_pos_feats),
             nn.GELU(),
-            nn.Linear(num_pos_feats, out_dim//2),
+            nn.Linear(num_pos_feats, out_dim//decompose_feats),
         )
 
     def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
         """Positionally encode points that are normalized to [0,1]."""
-        # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shap
+        # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
         coords = 2 * coords - 1
         #coords = coords @ self.positional_encoding_gaussian_matrix
         coords = coords @ self.positional_encoding_gaussian
@@ -53,13 +57,11 @@ class PositionEmebeddingFourierLearned(nn.Module):
         """
         Args:
             x (torch.Tensor): Bounding boxes to be embedded. Shape (N_tracks, self.context_dim, 4).
-        """
-        
-        x = rearrange(x, 'b n (g m) -> b n g m', g=2)
+        """ 
+        x = rearrange(x, 'b n (g m) -> b n g m', m=self.decompose_feats)
         x = self._pe_encoding(x)
 
         x = self.ffn(x)
-
         x = rearrange(x, 'b n g m -> b n (g m)')
 
         return x

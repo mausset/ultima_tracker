@@ -94,26 +94,36 @@ class RuntimeTracker(nn.Module):
 
         self.time_since_seen = {}
         self.tracks = {}
-        self.max_id = 0
+        self.max_id = 1
         self.max_context = 25 - 1
 
     def reset(self):
         self.time_since_seen = {}
         self.tracks = {}
-        self.max_id = 0
+        self.max_id = 1
  
-    def _init_fresh_tracks(self, proposal_queries):
+    def init_fresh_tracks(self, proposal_queries):
         assigned_ids = []
         for proposal_query in proposal_queries:
-            self.tracks[self.max_id] = [proposal_query]
-            self.time_since_seen[self.max_id] = 0
-            assigned_ids.append(self.max_id)
-            self.max_id += 1
+            assigned_ids.append(self._add_track(proposal_query))
         
         return assigned_ids
 
+    def _add_track(self, proposal_query):
+        self.tracks[self.max_id] = [proposal_query]
+        self.time_since_seen[self.max_id] = 0
+        self.max_id += 1
+
+        return self.max_id - 1
+    
+    def no_proposals(self):
+        for track_id in self.tracks.keys():
+            self.tracks[track_id].append(torch.zeros((256,), device=self.tracks[track_id][0].device))
+            self.time_since_seen[track_id] += 1
+        self.cull_tracks()
+
     def get_tracks(self):
-        if self.max_id == 0:
+        if self.max_id == 1:
             return None, None
         track_ids, tracks = zip(*self.tracks.items())
         tracks = [torch.stack(track[-self.max_context:]).clone() for track in tracks]
@@ -121,11 +131,10 @@ class RuntimeTracker(nn.Module):
         return track_ids, tracks
  
     def get_assigments(self, sim_matrix, track_ids, proposal_queries):
-        if len(self.tracks) == 0:
-            return self._init_fresh_tracks(proposal_queries)
+        if sim_matrix is None:
+            return self.init_fresh_tracks(proposal_queries)
         
-        # Solve the linear assignment problem using the Hungarian algorithm and get correct matches
-        cost, row, col = lap.lapjv(sim_matrix.numpy(), extend_cost=True, cost_limit=self.similarity_threshold)
+        _, row, col = lap.lapjv(1-sim_matrix.cpu().numpy(), extend_cost=True, cost_limit=self.similarity_threshold)
 
         for identity, r in zip(track_ids, row):
             if r == -1:
@@ -134,17 +143,14 @@ class RuntimeTracker(nn.Module):
             else:
                 self.time_since_seen[identity] = 0
                 self.tracks[identity].append(proposal_queries[r])
-
+            
         assigned_ids = np.zeros_like(col) - 1
         for i, (proposal, c) in enumerate(zip(proposal_queries, col)):
             if c == -1:
-                self.tracks[self.max_id] = [proposal]
-                self.time_since_seen[self.max_id] = 0
-                assigned_ids[i] = self.max_id 
-                self.max_id += 1
+                assigned_ids[i] = self._add_track(proposal)
             else:
                 assigned_ids[i] = track_ids[c]
-            
+         
         return assigned_ids
     
     def cull_tracks(self):
@@ -195,19 +201,29 @@ class Detector(object):
         keep = areas > area_threshold
         return dt_instances[keep]
 
-    def get_similarity_matrix(self, tracks: list[torch.tensor], proposals: torch.tensor) -> torch.Tensor:
+    def get_similarity_matrix(self, predictions: torch.tensor, proposals: torch.tensor) -> torch.Tensor: 
+        if predictions is None:
+            return None
+
+        return torch.matmul(normalize(predictions, dim=-1), normalize(proposals, dim=-1).T)
+    
+    def get_predictions(self, tracks: list[torch.tensor]) -> torch.Tensor:
+        if tracks is None:
+            return None
+
+        lengths = torch.tensor([len(track) for track in tracks], device=tracks[0].device)
         padded_tracks = torch.nn.utils.rnn.pad_sequence(tracks, batch_first=True)
         predictions = self.detr.predictor(padded_tracks)
- 
-        return torch.matmul(normalize(predictions, dim=-1), normalize(proposals, dim=-1).T)
+        predictions = torch.stack([p[-1] for p in torch.nn.utils.rnn.unpad_sequence(predictions, lengths, batch_first=True)])
+        predictions = self.detr.mixer(predictions)
+
+        return predictions
 
     def detect(self, prob_threshold=0.5, area_threshold=100, vis=False):
-        total_dts = 0
-        total_occlusion_dts = 0
-
-        track_instances = None
+        
         with open(os.path.join(self.args.mot_path, self.args.det_db)) as f:
             det_db = json.load(f)
+
         loader = DataLoader(ListImgDataset(self.args.mot_path, self.img_list, det_db), 1, num_workers=2)
         lines = []
         for i, data in enumerate(tqdm(loader, leave=False, desc=self.vid)):
@@ -217,30 +233,38 @@ class Detector(object):
             proposal_scores = proposals[:, -1].unsqueeze(-1)
             
             proposals = box_cxcywh_to_xyxy(proposals[:, :-1])
+            proposals = torch.clamp(proposals, 0, 1)
 
             seq_h, seq_w, _ = ori_img.shape
- 
+
             samples = NestedTensor(
                 cur_img,
                 torch.zeros((seq_h, seq_w), dtype=torch.bool, device=cur_img.device).unsqueeze(0)
             )
 
-            proposal_queries = self.detr(samples, proposals.unsqueeze(0), proposal_scores=proposal_scores).squeeze(0)
-                         
+            proposal_queries, refined_scores = self.detr(samples, proposals.unsqueeze(0), proposal_scores=proposal_scores.unsqueeze(0))
+            proposal_queries = proposal_queries.squeeze(0)
+            refined_scores = refined_scores.squeeze([0, 2])
+             
+            proposal_queries = proposal_queries[refined_scores > self.args.pred_score_threshold]
+            proposals = proposals[refined_scores > self.args.pred_score_threshold]
+            refined_scores = refined_scores[refined_scores > self.args.pred_score_threshold] 
+
+            if proposal_queries.shape[0] == 0:
+                self.tracker.no_proposals()
+                continue
+
             track_ids, tracks = self.tracker.get_tracks()
-            if tracks is None:
-                identities = self.tracker._init_fresh_tracks(proposal_queries)
-            else:
-                sim_matrix = self.get_similarity_matrix(tracks, proposal_queries)
-                identities = self.tracker.get_assigments(sim_matrix, track_ids, proposal_queries)
+            
+            predictions = self.get_predictions(tracks)
+            sim_matrix = self.get_similarity_matrix(predictions, proposal_queries)
+            identities = self.tracker.get_assigments(sim_matrix, track_ids, proposal_queries) 
 
             self.tracker.cull_tracks()
 
             bbox_xyxy = normalized_to_pixel_coordinates(proposals, seq_h, seq_w)
             save_format = '{frame},{id},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},1,-1,-1,-1\n'
             for xyxy, proposal_id in zip(bbox_xyxy, identities):
-                if proposal_id < 0 or proposal_id is None:
-                    continue
                 x1, y1, x2, y2 = xyxy
                 w, h = x2 - x1, y2 - y1
                 lines.append(save_format.format(frame=i + 1, id=proposal_id, x1=x1, y1=y1, w=w, h=h))
@@ -253,26 +277,24 @@ if __name__ == '__main__':
     torch.set_printoptions(precision=2, linewidth=200, sci_mode=False)
 
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    parser.add_argument('--score_threshold', default=0.5, type=float)
-    parser.add_argument('--update_score_threshold', default=0.5, type=float)
-    parser.add_argument('--miss_tolerance', default=20, type=int)
+    parser.add_argument('--score_threshold', default=0.05, type=float)
+    parser.add_argument('--pred_score_threshold', default=0.5, type=float)
+    parser.add_argument('--miss_tolerance', default=24, type=int)
+    parser.add_argument('--association_threshold', default=0.5, type=float)
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # load model and weights
     detr, _, _ = build_model(args)
-    # detr.track_embed.score_thr = args.update_score_threshold
-    tracker = RuntimeTracker(0.31, args.miss_tolerance)
-    # detr.track_base = RuntimeTracker(args.score_threshold, args.miss_tolerance)
+    tracker = RuntimeTracker(args.association_threshold, args.miss_tolerance)
     checkpoint = torch.load(args.resume, map_location='cpu')
-    # detr = load_model(detr, args.resume)
     detr.load_state_dict(checkpoint['model'])
     detr.eval()
     detr = detr.cuda()
 
     # '''for MOT17 submit''' 
-    sub_dir = 'DanceTrack/val'
+    sub_dir = 'DanceTrack/test'
     seq_nums = os.listdir(os.path.join(args.mot_path, sub_dir))
     if 'seqmap' in seq_nums:
         seq_nums.remove('seqmap')
@@ -284,5 +306,6 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         for vid in tqdm(vids, desc='vid'):
+            tracker.reset()
             det = Detector(args, model=detr, tracker=tracker, vid=vid)
             det.detect(args.score_threshold)

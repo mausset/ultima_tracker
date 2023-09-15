@@ -303,9 +303,11 @@ def main(args):
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
 
+    # Optimizations
+    torch.backends.cuda.enable_flash_sdp(True)
+
     print("Start training")
     start_time = time.time()
-
     dataset_train.set_epoch(args.start_epoch)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
