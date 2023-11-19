@@ -17,13 +17,13 @@ rmpyc() {
   rm -rf $(find -name "*.pyc")
 }
 
-cp submit_dance.py $OUTPUT_DIR
+cp feature_visualizations.py $OUTPUT_DIR
 
 pushd $OUTPUT_DIR
 
 args=$(cat *.args)
 # rlaunch --cpu 8 --gpu 1 --memory 24000 --positive-tags 2080ti -P 13 -- python3 submit_dance.py ${args} --resume checkpoint.pth --exp_name tracker
-python3 submit_dance.py ${args} --association_threshold $ASSOCIATION_THRESHOLD --resume checkpoint.pth --exp_name tracker --dataset $3 --split $4
+python3 feature_visualizations.py ${args} --association_threshold $ASSOCIATION_THRESHOLD --resume checkpoint.pth --exp_name tracker
 
 popd
 

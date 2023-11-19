@@ -1,3 +1,39 @@
+# Ultima Tracker: Learning Tracking through Joint Embedding Predictive Architectures
+
+This repository builds off of the repository of MOTRv2. For general information about the repository, such as how to handle datasets, we suggest you read their instructions (which follow our instructions.)
+
+## Introduction
+This project consists of an initial exploration of the application of Joint-Embedding Predictive Architectures to the task of Multi-Object Tracking. More specifically, we train a model that takes images and detections from an pre-trained object detector and learns to encode this information into a feature space. Furthermore, a predictor is trained in conjunction with the encoder, taking a history of encoded detections for an object and predicting its future representation. Once the model is trained, tracking can be performed through matching of the newly encoded detections and the predicted representations of past observed object, through cosine similarity. It may seem a bit esoteric, but I will attach the master's thesis that this research spawned, as the method is better explained there.
+
+To get started, make sure you have TrackEval and create a Python environment (I used 3.9.7) with your environment manager of choice (i.e. conda) and install the requirements through `pip install -r requirements.txt`. You will also need to setup the datasets following the instructions of MOTRv2.
+
+### Basics
+After making sure that all of the datasets are in place, a new model can be trained through: `./tools/train.sh ./configs/motrv2.args`. New experiments (training runs) are saved to the `exps` directory.
+
+To evaluate a model, you can use `tools/eval_dance.sh`, e.g: `./tools/eval_dance.sh exps/path/to/your/experiment assocation_threshold`. The association threshold is a hyperparameter that specifies how discriminative to be when performing matching. 
+
+There exists two quality-of-life scripts that I've provided to make life easy when searching for optimal hyperparameters. `ez_eval_search.sh` will search the association threshold for you, though you have to edit the range it searches in the file. With `ez_eval.sh` you can easily evaluate for a specific association threshold. After computing the assocations, both scripts use TrackEval to output tracking metrics in the directory `results` that can be used to evaluate how well the method performed. Example usage:
+
+```sh
+./ez_eval_search.sh path/to/experiment dataset split
+./ez_eval_search.sh golden/predictive_final dancetrack train
+```
+
+```sh
+./ez_eval.sh path/to/experiment assocation_threshold dataset split
+./ez_eval.sh golden/predictive_final 0.7 mot17 train
+```
+
+## Potential future research
+The method performs quite well, but could certainly be improved. Here is a list of possible future directions that I suggest considering. I imagine each of them would yield improved performance:
+- Employ Deformable-DETR, or Deformable-DAB-DETR, rather than the standard DETR used here.
+- Explore other training objectives that are not contrastive, e.g. mean teacher.
+- Change the predictor such that objects can look at both their own past and that of others throughout the entire model.
+- Increase context lengths (will require more VRAM).
+
+## If something doesn't make sense
+Read the code. I found it to be confusing at first as well, and the "scaffolding" code is not entirely trivial, so I suggest a thorough readthrough before your start modifying things. There are patches here and there that I have needed to apply for my own use case, so you will probably encounter a bit of commented-out code. I have tried to trim the rough edges for the sake of all of our sanities.
+
 # MOTRv2: Bootstrapping End-to-End Multi-Object Tracking by Pretrained Object Detectors
 
 [![arXiv](https://img.shields.io/badge/arXiv-2211.09791-COLOR.svg)](https://arxiv.org/abs/2211.09791)
