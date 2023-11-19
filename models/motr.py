@@ -33,47 +33,46 @@ import lap
 from positional_encodings.torch_encodings import PositionalEncoding1D, Summer
 from einops import rearrange
 
+from x_transformers import ContinuousTransformerWrapper, Decoder, Encoder
+
 class TrainingTracker(nn.Module):
     
     def __init__(self) -> None:
         super().__init__()
         self.tracks = {}
         self.observation_mask = {}
-        self.bboxes = {}
         self.time_step = 0
 
     def reset(self):
         self.tracks = {}
         self.observation_mask = {}
-        self.bboxes = {}
         self.time_step = 0
  
-    def update(self, queries, bboxes, labels):
-        for query, bbox, label in zip(queries, bboxes, labels):
+    def update(self, queries, labels):
+        for query, label in zip(queries, labels):
             new = False
             if label not in self.tracks:
                 self.tracks[label] = [torch.zeros_like(query)] * self.time_step
-                self.bboxes[label] = [torch.zeros_like(bbox)] * self.time_step
                 self.observation_mask[label] = [0] * self.time_step
                 new = True
             self.tracks[label].append(query)
-            self.bboxes[label].append(bbox)
             self.observation_mask[label].append(0 if new else 1) # Ignore the first observation of a track
         
         not_seen = set(self.tracks.keys()) - set(labels) 
         for label in not_seen:
             self.tracks[label].append(torch.zeros((256,)).to(queries.device))
-            self.bboxes[label].append(torch.zeros((4,)).to(queries.device))
             self.observation_mask[label].append(0)
         
         self.time_step += 1
     
     def get_tracks(self): 
+        if len(self.tracks) == 0:
+            return None, None
+
         tracks = torch.stack([torch.stack(track) for track in self.tracks.values()])
-        bboxes = torch.stack([torch.stack(bbox) for bbox in self.bboxes.values()])
         observation_masks = torch.stack([torch.tensor(observation_mask) for observation_mask in self.observation_mask.values()]).bool()
 
-        return tracks.clone(), bboxes.clone(), observation_masks.clone()
+        return tracks.clone(), observation_masks.clone()
 
 class ContrastiveCriterion(nn.Module):
 
@@ -172,6 +171,56 @@ class IterativeRefinement(nn.Module):
      
         return x, confidence
 
+class Predictor(nn.Module):
+
+    def __init__(self, stages=3, d_model=256, n_layer=3) -> None:
+        super().__init__()
+        
+        self.predictors = [
+            ContinuousTransformerWrapper(
+                max_seq_len=25,
+                attn_layers=Decoder(
+                    dim=d_model,
+                    depth=n_layer,
+                    heads=8,
+                    dim_head=64,
+                    rotary_pos_emb=True,
+                    ff_mult=4,
+                    attn_flash=True,
+                    ff_glu=True
+                )
+            ).cuda()
+            for _ in range(stages)
+        ]
+
+        #self.mixers = [
+        #    ContinuousTransformerWrapper(
+        #        max_seq_len=100,
+        #        attn_layers=Encoder(
+        #            dim=d_model,
+        #            depth=n_layer,
+        #            heads=8,
+        #            dim_head=64,
+        #            ff_mult=4,
+        #            attn_flash=True,
+        #            ff_glu=True
+        #        )
+        #    ).cuda()
+        #    for _ in range(stages-1)
+        #]
+
+    def forward(self, x, src_key_padding_mask=None):
+        #for predictor, mixer in zip(self.predictors, self.mixers):
+        #    x = predictor(x)
+        #    x = rearrange(x, 'b n d -> n b d')
+        #    x = mixer(x) #, mask=src_key_padding_mask)
+        #    x = rearrange(x, 'n b d -> b n d')
+
+        #x = self.predictors[-1](x)  
+        for predictor in self.predictors:
+            x = predictor(x)
+
+        return x
 
 class MOTR(nn.Module):
 
@@ -208,24 +257,12 @@ class MOTR(nn.Module):
             n_layer=dec_layers,
             position_embed=self.position_embed
         )
-         
-        predictor_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, 
-            nhead=8, 
-            norm_first=True, 
-            dim_feedforward=4*hidden_dim, 
-            batch_first=True
-        )
-        self.predictor_encoder = nn.TransformerEncoder(predictor_encoder_layer, num_layers=predictor_layers)
 
-        mixer_layer = nn.TransformerEncoderLayer(
+        self.predictor_head = Predictor(
+            stages=2,
             d_model=hidden_dim,
-            nhead=8,
-            norm_first=True,
-            dim_feedforward=4*hidden_dim,
-            batch_first=True
+            n_layer=3
         )
-        self.mixer_encoder = nn.TransformerEncoder(mixer_layer, num_layers=3)
     
     def image_feature_grid(self, feature_shape):
         h, w = feature_shape
@@ -238,19 +275,12 @@ class MOTR(nn.Module):
 
         return torch.stack((xx, yy, xx+height, yy+width), dim=-1) 
         
-    def predictor(self, x):
-        causal_mask = torch.triu(torch.ones((x.shape[1], x.shape[1])), diagonal=1).to(x.device).bool() 
-        x = self.query_pos_enc(x)
-        x = self.predictor_encoder(x, mask=causal_mask, is_causal=True)
-        return x
-    
-    def mixer(self, x, src_key_padding_mask=None):
-        x = self.mixer_encoder(x, src_key_padding_mask=src_key_padding_mask)
-        return x
-    
+    def predictor(self, x, src_key_padding_mask=None):
+        return self.predictor_head(x, src_key_padding_mask=src_key_padding_mask)
+     
     def forward(self, samples: NestedTensor, proposals, proposal_scores, tgt_key_padding_mask=None):
-        features, pos = self.backbone(samples)
-        src, mask = features[-1].decompose()
+        features, _ = self.backbone(samples)
+        src, _ = features[-1].decompose()
         src = rearrange(src, 'b c h w -> b h w c')
 
         src = self.image_projection(src) 

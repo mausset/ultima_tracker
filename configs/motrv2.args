@@ -1,8 +1,8 @@
 --meta_arch motr
 --dataset_file e2e_dance
---epoch 10
+--epoch 50
 --with_box_refine
---lr_drop 9
+--lr_drop 40
 --lr 2e-4
 --lr_backbone 2e-5
 --save_period 2

@@ -33,13 +33,15 @@ from util.misc import NestedTensor
 from util.box_ops import box_cxcywh_to_xyxy
 
 from einops import rearrange, repeat
+from torchsummary import summary
 
 class ListImgDataset(Dataset):
-    def __init__(self, mot_path, img_list, det_db) -> None:
+    def __init__(self, mot_path, img_list, det_db, mot17=False) -> None:
         super().__init__()
         self.mot_path = mot_path
         self.img_list = img_list
         self.det_db = det_db
+        self.mot17 = mot17
 
         '''
         common settings
@@ -55,6 +57,8 @@ class ListImgDataset(Dataset):
         cur_img = cv2.cvtColor(cur_img, cv2.COLOR_BGR2RGB)
         proposals = []
         im_h, im_w = cur_img.shape[:2]
+        if self.mot17:
+            f_path = f_path.replace('MOT17/', 'MOT17/images/')
         for line in self.det_db[f_path[:-4] + '.txt']:
             l, t, w, h, s = list(map(float, line.split(',')))
             proposals.append([(l + w / 2) / im_w,
@@ -188,19 +192,6 @@ class Detector(object):
         self.predict_path = os.path.join(self.args.output_dir, args.exp_name)
         os.makedirs(self.predict_path, exist_ok=True)
 
-    @staticmethod
-    def filter_dt_by_score(dt_instances: Instances, prob_threshold: float) -> Instances:
-        keep = dt_instances.scores > prob_threshold
-        keep &= dt_instances.obj_idxes >= 0
-        return dt_instances[keep]
-
-    @staticmethod
-    def filter_dt_by_area(dt_instances: Instances, area_threshold: float) -> Instances:
-        wh = dt_instances.boxes[:, 2:4] - dt_instances.boxes[:, 0:2]
-        areas = wh[:, 0] * wh[:, 1]
-        keep = areas > area_threshold
-        return dt_instances[keep]
-
     def get_similarity_matrix(self, predictions: torch.tensor, proposals: torch.tensor) -> torch.Tensor: 
         if predictions is None:
             return None
@@ -219,12 +210,12 @@ class Detector(object):
 
         return predictions
 
-    def detect(self, prob_threshold=0.5, area_threshold=100, vis=False):
+    def detect(self, prob_threshold=0.5, area_threshold=100, vis=False, mot17=False):
         
         with open(os.path.join(self.args.mot_path, self.args.det_db)) as f:
             det_db = json.load(f)
 
-        loader = DataLoader(ListImgDataset(self.args.mot_path, self.img_list, det_db), 1, num_workers=2)
+        loader = DataLoader(ListImgDataset(self.args.mot_path, self.img_list, det_db, mot17=mot17), 1, num_workers=2)
         lines = []
         for i, data in enumerate(tqdm(loader, leave=False, desc=self.vid)):
             cur_img, ori_img, proposals = [d[0] for d in data]
@@ -241,6 +232,11 @@ class Detector(object):
                 cur_img,
                 torch.zeros((seq_h, seq_w), dtype=torch.bool, device=cur_img.device).unsqueeze(0)
             )
+
+
+            if proposals.shape[0] == 0:
+                self.tracker.no_proposals()
+                continue
 
             proposal_queries, refined_scores = self.detr(samples, proposals.unsqueeze(0), proposal_scores=proposal_scores.unsqueeze(0))
             proposal_queries = proposal_queries.squeeze(0)
@@ -273,14 +269,15 @@ class Detector(object):
             f.writelines(lines)
 
 if __name__ == '__main__':
+    mot17 = True
     
     torch.set_printoptions(precision=2, linewidth=200, sci_mode=False)
 
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
     parser.add_argument('--score_threshold', default=0.05, type=float)
-    parser.add_argument('--pred_score_threshold', default=0.5, type=float)
+    parser.add_argument('--pred_score_threshold', default=0.50, type=float)
     parser.add_argument('--miss_tolerance', default=24, type=int)
-    parser.add_argument('--association_threshold', default=0.5, type=float)
+    parser.add_argument('--association_threshold', default=0.45, type=float)
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -294,7 +291,7 @@ if __name__ == '__main__':
     detr = detr.cuda()
 
     # '''for MOT17 submit''' 
-    sub_dir = 'DanceTrack/test'
+    sub_dir = 'MOT17/test'
     seq_nums = os.listdir(os.path.join(args.mot_path, sub_dir))
     if 'seqmap' in seq_nums:
         seq_nums.remove('seqmap')
@@ -304,8 +301,11 @@ if __name__ == '__main__':
     ws = int(os.environ.get('RLAUNCH_REPLICA_TOTAL', '1'))
     vids = vids[rank::ws]
 
+    if mot17:
+        vids = [x for x in vids if 'SDP' in x]
+
     with torch.no_grad():
         for vid in tqdm(vids, desc='vid'):
             tracker.reset()
             det = Detector(args, model=detr, tracker=tracker, vid=vid)
-            det.detect(args.score_threshold)
+            det.detect(args.score_threshold, mot17=mot17)

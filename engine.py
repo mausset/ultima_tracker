@@ -34,10 +34,11 @@ from einops import rearrange
 
 def preprocess_batch(data_dict: dict, matcher: HungarianMatcher):
     gt_ids = []
-    gt_bboxes_list = []
     bboxes = []
     matched_masks = []
     scores = []
+
+    has_matched = False
     for i in range(len(data_dict['imgs'])):
         gt_instances = data_dict['gt_instances'][i]
         proposals = data_dict['proposals'][i]
@@ -49,7 +50,6 @@ def preprocess_batch(data_dict: dict, matcher: HungarianMatcher):
 
         if gt_boxes.shape[0] == 0 or proposal_boxes.shape[0] == 0:
             gt_ids.append([])
-            gt_bboxes_list.append(torch.zeros((0, 4), device=gt_boxes.device))
             bboxes.append(torch.zeros((0, 4), device=gt_boxes.device))
             scores.append(torch.zeros((0, 1), device=gt_boxes.device))
             matched_masks.append(torch.zeros((0, 1), device=gt_boxes.device))
@@ -59,9 +59,9 @@ def preprocess_batch(data_dict: dict, matcher: HungarianMatcher):
 
         gt_obj_ids = gt_obj_ids[row != -1]
         gt_ids.append(gt_obj_ids.to(torch.long).tolist())
-        gt_b = gt_boxes[row != -1]
-        gt_bboxes_list.append(gt_b)
         valid_idx = row[row != -1]
+        if valid_idx.shape[0] != 0:
+            has_matched = True
 
         matched_proposal_boxes = torch.clamp(proposal_boxes[valid_idx], min=0, max=1)
         matched_proposal_scores = proposal_scores[valid_idx].unsqueeze(1)
@@ -77,7 +77,7 @@ def preprocess_batch(data_dict: dict, matcher: HungarianMatcher):
         scores.append(score)
         matched_masks.append(mask)
      
-    return bboxes, scores, gt_bboxes_list, gt_ids, matched_masks
+    return bboxes, scores, gt_ids, matched_masks, has_matched
 
 def train_one_epoch_mot(model: torch.nn.Module, criterion: ContrastiveCriterion,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -111,7 +111,10 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: ContrastiveCriterion,
 
         cnt += 1
         data_dict = data_dict_to_cuda(data_dict, device)
-        bboxes, scores, gt_bboxes, gt_ids, matched_masks = preprocess_batch(data_dict, matcher)
+        bboxes, scores, gt_ids, matched_masks, has_matched = preprocess_batch(data_dict, matcher)
+
+        if not has_matched:
+            continue
         
         imgs = torch.stack(data_dict['imgs'])
 
@@ -159,31 +162,26 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: ContrastiveCriterion,
         unpadded_queries = torch.nn.utils.rnn.unpad_sequence(queries, lengths, batch_first=True)
         unpadded_queries = [x[mask.bool().squeeze(1)] for x, mask in zip(unpadded_queries, matched_masks)]
 
-        for q, b, ids in zip(unpadded_queries, gt_bboxes, gt_ids):
-            training_tracker.update(q, b, ids)
+        for q, ids in zip(unpadded_queries, gt_ids):
+            training_tracker.update(q, ids)
         
-        tracks, track_bboxes, observation_mask = training_tracker.get_tracks() 
+        tracks, observation_mask = training_tracker.get_tracks() 
 
-        with autocast(dtype=torch.bfloat16):
-            predictions = model.predictor(tracks)
-        
         cum_mask, _ = torch.cummax(observation_mask, dim=1)
         mask = cum_mask[:, :-1] & observation_mask[:, 1:]
 
+        key_padding_mask = ~cum_mask.to(device)
+        with autocast(dtype=torch.bfloat16):
+            predictions = model.predictor(tracks, src_key_padding_mask=key_padding_mask)
+
+        
         predictions = predictions[:, :-1]
         targets = tracks[:, 1:]
-        track_bboxes = track_bboxes[:, 1:]
 
         predictions = rearrange(predictions, 'b n d -> n b d')
         targets = rearrange(targets, 'b n d -> n b d')
-        track_bboxes = rearrange(track_bboxes, 'b n d -> n b d')
         mask = rearrange(mask, 'b n -> n b')
-        cum_mask = rearrange(cum_mask, 'b n -> n b')
 
-        key_padding_mask = ~cum_mask[:-1].to(device)
-        key_padding_mask[torch.prod(key_padding_mask, dim=0), :] = False # Don't mask out all queries in a batch, will cause nan:s
-        with autocast(dtype=torch.bfloat16):
-            predictions = model.mixer(predictions, src_key_padding_mask=key_padding_mask)
         
         losses = []
         accs = []
